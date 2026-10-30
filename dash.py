@@ -135,7 +135,7 @@ def http_get(url, timeout=8):
 
 def read_text(path):
     try:
-        return Path(path).read_text().strip()
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except Exception:
         return None
 
@@ -242,14 +242,14 @@ def slow_once():
         snap["engine_version"] = ver.get("engine") if isinstance(ver, dict) else None
     except Exception as e:
         snap["halogen_ok"] = False
-        snap["err_health"] = repr(e)[:100]
+        snap["err_health"] = type(e).__name__
     try:
         p = json.loads(fetch_retry(lambda t: http_get(HAL + "/props", timeout=t or 3)))
         snap["model_alias"] = p.get("model_alias")
         snap["total_slots"] = p.get("total_slots")
         snap["engine_sleeping"] = bool(p.get("is_sleeping"))
     except Exception as e:
-        snap["err_props"] = repr(e)[:100]
+        snap["err_props"] = type(e).__name__
     with _lock:
         _slow.clear()
         _slow.update(snap)
@@ -288,7 +288,7 @@ def collect_once():
         da = m.get("halogen:draft_tokens_accepted_total")
         snap["draft_accept_rate"] = (da / dt) if (dt and da is not None) else None
     except Exception as e:
-        snap["err_metrics"] = repr(e)[:100]
+        snap["err_metrics"] = type(e).__name__
     try:
         c = json.loads(fetch_retry(lambda t: http_get(HAL + "/cache", timeout=t or 2)))
         pool = c.get("pool") if isinstance(c.get("pool"), dict) else {}
@@ -313,7 +313,7 @@ def collect_once():
         # w19-B4：连续 3 拍失败才判异常；1-2 拍宽限期内保持上值 + stale（前端置灰）+ 数据年龄
         _cache_miss += 1
         if _cache_miss >= 3:
-            snap["err_cache"] = repr(e)[:100]
+            snap["err_cache"] = type(e).__name__
     if _cache_miss > 0:
         snap["cache_stale"] = True
         if isinstance(_cache_ok_ts, (int, float)):
@@ -352,7 +352,7 @@ def collect_once():
                 snap["pano_free_gib"] = round(free / gib, 1)
                 snap["pano_pinned_gib"] = round(max(pinned, 0) / gib, 1)
     except Exception as e:
-        snap["err_meminfo"] = repr(e)[:100]
+        snap["err_meminfo"] = type(e).__name__
     v = to_int(read_text(DRM / "gpu_busy_percent"))
     if v is not None:
         snap["gpu_busy_percent"] = v
@@ -392,6 +392,8 @@ def collect_once():
         elif _pending_gap:
             _pending_gap = False
             _speed_stale = None  # 误报只解除徽标；_stale_fp 保留至新行采信（V8-N1）
+            _spd_win.clear()     # w21-①：误报恢复清 decode 速度窗，⛔ 残留 gap 前陈旧速度
+            _decode_tps = None   # w21-①：decode tps 中间值同步置 None
         _prev_pred = pred
     else:
         _metrics_miss += 1
@@ -1043,7 +1045,7 @@ function isNum(x){return typeof x==='number'&&isFinite(x);}
 function num(x,d){if(!isNum(x))return '—';
   if(d==null)return Math.round(x).toLocaleString('en-US');return x.toFixed(d);}
 var F0=function(x){return num(x,0);};
-var GiB=function(x){return (x/1073741824).toFixed(1)+' GiB';};
+var GiB=function(x){return isNum(x)?(x/1073741824).toFixed(1)+' GiB':'—';};
 var HK=['ts','in_flight','queued','kv_cache_usage_ratio','cache_bytes',
         'predicted_tokens_seconds','decode_total_tps','gpu_busy_percent','gpu_temp_c','gpu_power_w',
         'ev_relocated','ev_cold_resorts','ev_room_clamped'];
@@ -1997,7 +1999,7 @@ class Handler(BaseHTTPRequestHandler):
                 snap = None
                 with _cond:
                     while _tick == last:
-                        if not _cond.wait(15.0):
+                        if not _cond.wait(3.0):
                             break
                     if _tick != last:
                         last = _tick
