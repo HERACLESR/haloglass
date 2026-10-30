@@ -50,7 +50,7 @@ ALLOWED_HOSTS |= {h.strip().lower() for h in os.environ.get("DASH_ALLOWED_HOSTS"
 HISTORY_KEYS = ("ts", "in_flight", "queued", "kv_cache_usage_ratio",
                 "req_decode_ts", "cache_bytes", "mem_available_gib",
                 "gpu_busy_percent", "cpu_temp_c", "gpu_temp_c",
-                "ev_relocated", "ev_cold_resorts", "gpu_power_w",
+                 "ev_relocated", "ev_cold_resorts", "ev_room_clamped", "gpu_power_w",
                 "gpu_mem_used_gib", "predicted_tokens_seconds",
                 "decode_total_tps")
 
@@ -68,10 +68,25 @@ _req_fp = None      # 历史日志行指纹槽位（podman 下线后恒 None，�
 _stale_fp = None    # 疑似（断供通道）黑名单（同上，恒 None）
 _confirmed_fp = None  # 确认（回退通道）黑名单（同上，恒 None）
 _speed_stale = None   # None | "restarted"（counter 回退确认）| "metrics_gap"（仅断供疑似）
-_decode_win = deque(maxlen=120)   # w10-ⓕ：(墙钟ts, decode_tokens_total) 60s 滑窗（G2 调研：总解码吞吐）；w15-bugP0-1：maxlen=120（≥DECODE_WIN_S 秒 @1拍/秒）硬上限，⛔ 无限增长
-DECODE_WIN_S = 60.0
-_last_speed = None      # w11-ⓕ2：最近一次引擎上报的单流速度（predicted_tokens_seconds 仅在请求完成时非零）
-DECODE_TPS_CAP = float(os.environ.get("DASH_DECODE_CAP", "72"))  # w13-ⓐ：本机带宽物理上限封顶（~70 tok/s，带宽共享不可加，in_flight×单流速乘积可虚高至 134）；w15-合规P1-2：DASH_DECODE_CAP 可配，前端经 data.json decode_cap 取同值
+# w19-B1 真值总速度窗口：每拍 (墙钟ts, Δtok, Δpgs, Δ墙钟, 上一拍 in_flight)，15s 滑窗；
+# 完成拍（Δpgs>0）汇总得每流纯速度，忙碌拍加权得并发度，二者相乘 = 总速度（无封顶）。
+_spd_win = deque(maxlen=120)
+DECODE_WIN_S = 15.0
+_prev_tok = None      # 上一拍 tokens_predicted_total（差分用，与重启检测 _prev_pred 分离）
+_prev_sec = None      # 上一拍 tokens_predicted_seconds_total
+_prev_ts = None       # 上一拍墙钟 ts
+_prev_ifl = None      # 上一拍 in_flight（忙碌拍判定 / 并发度加权）
+_decode_tps = None    # 最近一次真值总速度（w20-①：活跃样本 15s 滑窗自然衰减，空闲滑空→0.0+decode_idle；生成中 hold）
+# w19-B3 prefill 纯速度：Δprompt_tokens_total ÷ Δprompt_seconds_total，最近 5s 活跃拍加权，
+# 突发结束后 hold 最近一次值（引擎全有这两个 counter，2026-10-31 实测）。
+_pf_win = deque(maxlen=60)
+PF_WIN_S = 5.0
+_prev_ptok = None     # 上一拍 prompt_tokens_total
+_prev_psec = None     # 上一拍 prompt_seconds_total
+_prefill_tps = None   # 最近一次 prefill 突发纯速度（hold）
+# w19-B4 cache 宽限：连续 3 拍采集失败才判「异常」，期间保持上值 + stale + 数据年龄
+_cache_miss = 0
+_cache_ok_ts = None
 _slow = {}            # 慢通道快照（health/props），由 slow_collector 线程刷新
 
 
@@ -243,7 +258,10 @@ def slow_once():
 
 def collect_once():
     global _cycle, _prev_pred, _metrics_miss, _pending_gap, _req_fp, _stale_fp
-    global _confirmed_fp, _speed_stale, _tick, _last_speed
+    global _confirmed_fp, _speed_stale, _tick
+    global _prev_tok, _prev_sec, _prev_ts, _prev_ifl, _decode_tps
+    global _prev_ptok, _prev_psec, _prefill_tps
+    global _cache_miss, _cache_ok_ts
     _cycle += 1
     snap = {"ts": round(time.time(), 1)}
     with _lock:
@@ -260,6 +278,9 @@ def collect_once():
         snap["queue_gave_up_total"] = m.get("halogen:queue_gave_up_total")
         snap["decode_tokens_total"] = m.get("llamacpp:tokens_predicted_total")
         snap["predicted_tokens_seconds"] = m.get("llamacpp:predicted_tokens_seconds")
+        snap["predicted_tokens_seconds_total"] = m.get("llamacpp:tokens_predicted_seconds_total")
+        snap["prompt_tokens_total"] = m.get("llamacpp:prompt_tokens_total")
+        snap["prompt_seconds_total"] = m.get("llamacpp:prompt_seconds_total")
         snap["prompt_tokens_seconds"] = m.get("llamacpp:prompt_tokens_seconds")
         snap["requests_total"] = m.get("halogen:requests_total")
         snap["engine_up"] = m.get("halogen:engine_up")
@@ -286,8 +307,17 @@ def collect_once():
         snap["cache_superseded"] = c.get("superseded")
         if snap.get("cache_bytes") is None:
             snap["cache_bytes"] = c.get("bytes")
+        _cache_miss = 0
+        _cache_ok_ts = snap["ts"]
     except Exception as e:
-        snap["err_cache"] = repr(e)[:100]
+        # w19-B4：连续 3 拍失败才判异常；1-2 拍宽限期内保持上值 + stale（前端置灰）+ 数据年龄
+        _cache_miss += 1
+        if _cache_miss >= 3:
+            snap["err_cache"] = repr(e)[:100]
+    if _cache_miss > 0:
+        snap["cache_stale"] = True
+        if isinstance(_cache_ok_ts, (int, float)):
+            snap["cache_age_s"] = round(snap["ts"] - _cache_ok_ts, 1)
     try:
         mem = {}
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -381,42 +411,105 @@ def collect_once():
     if _speed_stale:
         snap["speed_stale"] = True
         snap["speed_stale_reason"] = _speed_stale
-    # w10-ⓕ 总解码吞吐（G2 调研）：decode_tokens_total 墙钟 60s 滑窗差分。
-    # 计数器只在请求完成时跳变 → 窗口 ≥60s 抹平阶梯；counter 回退=重启→清窗；
-    # processing(in_flight)=0 → 直接 0（不用陈旧窗口尾巴）；metrics 缺口拍不推点（前端 lastGood 保持）。
-    # w11-ⓕ2（用户批准，数值准确性）：长生成期间窗口差分≈0（实测 2026-10-29：in_flight=1、
-    # busy 71→113s 期间 counter 恒定且 predicted_tokens_seconds=0）→ 主口径改纯实时在途估算：
-    # 总吞吐 = in_flight × 最近一次上报的单流速度（引擎仅在请求完成时上报速度，无 per-slot
-    # 实时字段：/metrics 无带槽位标签序列、/props /cache 无槽位明细，2026-10-29 侦察）；
-    # 尚无速度史（如刚重启）→ 回退 w10 窗口差分；metrics 断供拍两口径都不写键（前端保持+置灰）。
+    # w19-B1 真值总速度（15s 滑动窗口，⛔ 不封顶）：
+    # 引擎的 tokens_predicted_total / tokens_predicted_seconds_total 只在请求完成时整块跳变
+    # （实测 2026-10-31：单请求 300 tok / 6.78 生成秒一次性到账），直接用 1s 采样间隔做分母
+    # 会把整段产出记到完成那一拍 → 300 tok/s 假尖峰（§5.6 同类问题）。
+    # 因此：纯生成速度 = ΣΔtok / ΣΔpgs（活跃拍，=每流平均速度），
+    #       并发度 = 忙碌拍的时间加权平均 in_flight（Σifl×Δwall / ΣΔwall），
+    #       总速度 = 纯生成速度 × 并发度（= Δtok/Δ墙钟 的等价形式，墙钟按生成时长还原）。
+    # w20-①（改 w19-B1「静止=hold」规范，用户实锤空闲 40s+ 仍显示 62.78=假活值）：
+    #   活跃样本（完成拍，dsec>0）15s 滑窗自然衰减——空闲后无新活跃样本进窗，
+    #   窗口滑空 → 0.0 + decode_idle（前端 .stale 置灰）；重新生成即恢复。
+    #   生成进行中（in_flight>0，counter 冻结无完成拍）→ 保持上一窗口值 ⛔ 不归零。
+    #   30m peak 不受影响（history 序列取 max，零值无害）。预填充模块仍 hold（「最近一次」语义，tooltip 已注明差异）。
+    # counter 回退 → 负增量丢弃并清窗。
+    ts_now = snap["ts"]
+    psec = snap.get("predicted_tokens_seconds_total")
+    ifl_now = snap.get("in_flight")
     if restart:
-        _decode_win.clear()
-        _last_speed = None
-    if isinstance(pred, (int, float)) and not restart:
-        try:  # w15-bugP0-1：窗口维护段纳入异常保护，⛔ 任何异常冒泡出 collect_once 杀采集节奏（冻结 _latest/_history/_tick）
-            _decode_win.append((snap["ts"], pred))
-            while _decode_win and snap["ts"] - _decode_win[0][0] > DECODE_WIN_S:
-                _decode_win.popleft()
+        _spd_win.clear()
+        _decode_tps = None
+        _prev_tok = _prev_sec = _prev_ts = _prev_ifl = None
+        _pf_win.clear()
+        _prefill_tps = None
+        _prev_ptok = _prev_psec = None
+    if isinstance(pred, (int, float)) and isinstance(psec, (int, float)) and not restart:
+        try:  # 窗口维护段纳入异常保护，⛔ 任何异常冒泡杀采集节奏（冻结 _latest/_history/_tick）
+            if _prev_tok is not None and _prev_sec is not None and _prev_ts is not None:
+                dtok = pred - _prev_tok
+                dsec = psec - _prev_sec
+                dwall = ts_now - _prev_ts
+                if dtok < 0 or dsec < 0:
+                    # 负增量 = counter 回退：丢弃本拍增量并清窗重算
+                    _spd_win.clear()
+                    _decode_tps = None
+                elif dwall > 0:
+                    _spd_win.append((ts_now, dtok, dsec, dwall, _prev_ifl))
+            _prev_tok, _prev_sec, _prev_ts = pred, psec, ts_now
+            _prev_ifl = ifl_now if isinstance(ifl_now, int) else None
         except Exception:
             pass
-    pts = snap.get("predicted_tokens_seconds")
-    if isinstance(pts, (int, float)) and pts > 0:
-        _last_speed = pts
-    ifl = snap.get("in_flight")
-    if ifl == 0:
-        snap["decode_total_tps"] = 0.0
-    elif isinstance(ifl, int) and ifl > 0 and _last_speed and isinstance(pts, (int, float)):
-        # w13-ⓐ：主值以本机带宽上限封顶（带宽共享不可加，2-3 槽乘积可超物理上限）
-        snap["decode_total_tps"] = round(min(ifl * _last_speed, DECODE_TPS_CAP), 2)
-    elif len(_decode_win) >= 2 and snap["ts"] - _decode_win[-1][0] <= 5:
-        # 窗口尾点必须新鲜（≤5s）：metrics 断供时不拿陈旧窗口造假鲜值，键缺失→前端 lastGood 保持+置灰
-        (tw0, pw0), (tw1, pw1) = _decode_win[0], _decode_win[-1]
-        if pw1 >= pw0 and tw1 > tw0:
-            # w13-ⓐ：冷启动回退窗口差分同封顶
-            snap["decode_total_tps"] = round(min((pw1 - pw0) / (tw1 - tw0), DECODE_TPS_CAP), 2)
+    # w20-①：滑窗修剪每拍都执行（w19 只在追加拍修剪 → 空闲时窗口永不滑空 = 假活根因）
+    try:
+        while _spd_win and ts_now - _spd_win[0][0] > DECODE_WIN_S:
+            _spd_win.popleft()
+    except Exception:
+        pass
+    spd_active = False
+    if _spd_win:
+        try:
+            st = sum(e[1] for e in _spd_win if e[2] > 0)   # 完成拍产出的 token
+            ss = sum(e[2] for e in _spd_win if e[2] > 0)   # 完成拍对应的纯生成秒（每流累加）
+            bw = sum(e[3] for e in _spd_win if (e[4] or 0) > 0)
+            bn = sum(e[3] * e[4] for e in _spd_win if (e[4] or 0) > 0)
+            if ss > 0 and st > 0:
+                conc = (bn / bw) if bw > 0 else 1.0
+                if conc < 1.0:
+                    conc = 1.0
+                _decode_tps = round((st / ss) * conc, 2)
+            spd_active = ss > 0  # 窗口内有活跃样本（完成拍）= 值新鲜
+        except Exception:
+            pass
+    metrics_fresh = isinstance(pred, (int, float)) and isinstance(psec, (int, float))
+    busy_now = isinstance(ifl_now, (int, float)) and ifl_now > 0
+    if metrics_fresh:
+        if spd_active or busy_now:
+            if isinstance(_decode_tps, (int, float)):
+                snap["decode_total_tps"] = _decode_tps  # 窗口活跃，或生成进行中 hold
+        else:
+            # 空闲且窗口滑空（无活跃样本 ≥15s）→ 归零 + idle 标志（前端 .stale 置灰）
+            snap["decode_total_tps"] = 0.0
+            snap["decode_idle"] = True
+    # metrics 断供拍不写键 → 前端 lastGood 保持 + 置灰（w9-I/w10-ⓖ 语义不破）
+    # w19-B3 prefill 纯速度：Δprompt_tokens_total ÷ Δprompt_seconds_total（最近 5s 活跃拍加权），
+    # 突发结束后 hold 最近一次值；counter 回退 → 负增量丢弃。
+    ptok = snap.get("prompt_tokens_total")
+    psec_p = snap.get("prompt_seconds_total")
+    if isinstance(ptok, (int, float)) and isinstance(psec_p, (int, float)) and not restart:
+        try:
+            if _prev_ptok is not None and _prev_psec is not None:
+                dpt = ptok - _prev_ptok
+                dps = psec_p - _prev_psec
+                if dpt < 0 or dps < 0:
+                    _pf_win.clear()
+                    _prefill_tps = None
+                elif dps > 0 and dpt > 0:
+                    _pf_win.append((ts_now, dpt, dps))
+                    while _pf_win and ts_now - _pf_win[0][0] > PF_WIN_S:
+                        _pf_win.popleft()
+            _prev_ptok, _prev_psec = ptok, psec_p
+        except Exception:
+            pass
+    if _pf_win:
+        try:
+            _prefill_tps = round(sum(x[1] for x in _pf_win) / sum(x[2] for x in _pf_win), 2)
+        except ZeroDivisionError:
+            pass
+    if metrics_fresh and isinstance(_prefill_tps, (int, float)):
+        snap["prefill_tps"] = _prefill_tps
     if _last_req:
         snap.update(_last_req)
-    # llamacpp:tokens_predicted_total 只在请求完成时跳变，逐周期差分是假速度 —— 不再计算
     n_slots = snap.get("slots")
     in_flight = snap.get("in_flight") or 0
     req_ts = snap.get("req_decode_ts")
@@ -434,7 +527,8 @@ def collect_once():
     with _lock:
         prev = _latest
         for k, d in (("cache_relocated", "ev_relocated"),
-                     ("cache_cold_resorts", "ev_cold_resorts")):
+                     ("cache_cold_resorts", "ev_cold_resorts"),
+                     ("cache_room_clamped", "ev_room_clamped")):
             a, b = prev.get(k), snap.get(k)
             ok = isinstance(a, (int, float)) and isinstance(b, (int, float)) and b >= a
             snap[d] = (b - a) if ok else 0
@@ -489,6 +583,7 @@ HTML = """<!DOCTYPE html>
   --hover:rgba(15,23,42,.04);
   --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.03);
   --r:24px;
+  --bar-h:72px;  /* w19-A2：顶栏与侧栏品牌盒共用高度变量，下沿强制对齐 */
   --bar-gap:2px;--bar-r:2px;
   --seg-idle-text:#475569;--seg-idle-bar:#64748b;
   --seg-norm-text:#295ff8;--seg-norm-bar:#4a77f9;
@@ -531,22 +626,23 @@ button{font:inherit}
 .app{display:grid;grid-template-columns:256px minmax(0,1fr);min-height:100vh;max-width:1680px;margin:0 auto}
 /* ---------- 侧栏 ---------- */
 .sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}
-.brand{height:72px;flex:none;display:flex;align-items:center;gap:8px;padding:0 24px;border-bottom:1px solid var(--border);font-size:18px;font-weight:700}
+.brand{height:var(--bar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 24px;border-bottom:1px solid var(--border);font-size:18px;font-weight:700}
 .brand svg{width:28px;height:28px;flex:none}
 .side-sec{padding:24px;border-bottom:1px solid var(--border);min-width:0}
-.side-title{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;display:flex;align-items:center;gap:8px}
-.model-name{font-size:14px;font-weight:600;font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:8px}
+.side-title{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;display:flex;align-items:center;gap:8px;min-width:0;overflow-wrap:anywhere}
+.model-name{font-size:14px;font-weight:600;font-family:var(--mono);white-space:normal;overflow-wrap:anywhere;word-break:break-word;margin-bottom:8px}  /* w19-A1：模型名完整折行显示（⛔ 省略号截断）；全名仍走 title 悬浮提示 */
 .kv-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:13px;color:var(--muted);padding:4px 0}
 .kv-row b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;font-family:var(--display);text-align:right;overflow-wrap:anywhere}
 .slot-li{display:flex;align-items:center;gap:8px;padding:4px 8px;margin:0 -8px;border-radius:12px;font-size:13px;font-variant-numeric:tabular-nums}
 .slot-li:hover{background:var(--hover)}
 .slot-li .spd{margin-left:auto;font-weight:600;font-family:var(--display)}
 .slot-li .idle-t{margin-left:auto;color:var(--muted);font-weight:400}
-.slot-li .slot-n{font-family:var(--mono);font-weight:600}  /* w13-ⓒ→w17-②：槽位编号数字=--mono 等宽栈（与采集健康状态列 code 同款，用户多次指正 ⛔ 勿回退 display/Space Grotesk）；行本身中文保持正文族（w10-ⓒ） */
+.slot-li .slot-n{font-family:var(--mono);font-weight:400;font-size:12px;color:var(--muted)}  /* w13-ⓒ→w17-②→w20-②：槽位编号数字=--mono 等宽栈；w20 实测 computed：字体栈本就同 .hrow code，差异在 size 13vs12/weight 600vs400/color 黑vs灰（w18 教训重演：真因非字体栈）→ 三项全对齐 .hrow code（12px/400/--muted），与「health」逐像素同款；行本身中文保持正文族（w10-ⓒ） */
+.slot-li .slot-nm{font-family:inherit;color:var(--muted)}  /* w18-①：「槽位」中文前缀=显式正文族（computed font-family 与其他模块中文逐字符一致，断言见 shots/post_assert_fonts.txt）+ 与其他模块中文标签同灰（w17 线上排查实锤：字体栈与实际用字本就一致，"看着像异体字"真因=黑色 --fg vs 其他模块中文 --muted 灰） */
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:none}
 .on{background:var(--up-text);animation:breathe 2.6s ease-in-out infinite}
 .off{background:var(--danger-text);animation:breathe 1.6s ease-in-out infinite}
-.wait{background:var(--bar-off)}
+.dot.wait{background:var(--bar-off)}  /* w20-⑥：作用域收 .dot——原裸 .wait 与 .mibars.wait 撞名，KPI 迷你柱容器被刷成 214×24 深灰填充框（用户实锤「银色填充框扎眼」根因，同 w3 .skel.kpi 撞名教训） */
 .sleep{background:var(--accent);animation:breathe 2.2s ease-in-out infinite}
 .busy{background:var(--up-text);animation:breathe 1.8s ease-in-out infinite}
 .idle{background:var(--bar-off)}
@@ -554,7 +650,12 @@ button{font:inherit}
 .dot:hover,.breath:hover,.st-pill:hover,.skel:hover{animation-play-state:paused}
 .skel:hover::after{animation-play-state:paused}
 .side-foot{margin-top:auto;padding:24px;display:flex;flex-direction:column;gap:8px}
-.qsep{border-top:1px solid var(--border);margin:16px 0 24px}
+.qsep{border-top:1px solid var(--border);margin:24px 0}  /* w20-④：分隔线上下对称 24/24（原 16/24 不对称；与 .side-sec 24 内边距同一间距 token） */
+.pf-block{margin-top:24px}  /* w19-B3：预填充速度模块（槽位状态↔请求状态之间）；w20-④：模块间垂直间距归一 24（原 16，与 qsep/section 节奏不一致） */
+.pf-row>span.pf-l{min-width:0;overflow-wrap:anywhere}
+.pf-row code{font-family:var(--mono);font-size:12px}  /* w20-③：「最近一次 prefill」英文词=mono 栈 12px（实测原走正文栈 Segoe UI，与采集健康 code 标签「health」异体；对齐后同 .hrow code） */
+.pf-v{display:inline-flex;align-items:baseline;gap:4px;flex:none}
+.pf-u{color:var(--muted);font-weight:400;font-size:11px;white-space:nowrap}  /* w19-B3：单位内联（⛔ .qu 绝对定位会伸出侧栏被裁） */
 /* w11-ⓞ 侧栏第三模块对齐：tabular-nums、基线对齐；「次/회」单位绝对定位悬挂，⛔ 不占对齐线
    w12-ⓐ ? 按钮移至模块标题右侧（与其他模块同款 side-title）
    w17-①：废弃 2×2 subgrid + 竖分隔线（竖线两侧净空左窄右宽，用户判不对称，放弃摆布）——
@@ -574,8 +675,13 @@ button{font:inherit}
 .h1-alert{width:10px;height:10px;border-radius:50%;background:var(--danger-text);flex:none;animation:qbreath 2s ease-in-out infinite}
 /* w10-ⓖ 速率类防归零：断供保持上一有效值+置灰 */
 .stale{color:var(--muted)!important;opacity:.6}
-.hrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.hrow{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}  /* w19-A5：标签列 min-width:0 折行、值列 flex-shrink:0（德语 Engine-Eigenschaften） */
+.hrow>span{min-width:0;overflow-wrap:anywhere}
+.hrow>code{flex:none}
+.hrow .hst{flex-shrink:0;white-space:nowrap}
+.hrow>span.dot{flex:none}
 .hrow+.hrow{margin-top:8px}
+.side-health .side-title+.hrow{padding-top:4px}  /* w18-③：采集健康 标题→首行 视觉间距 11→15px，对齐多数值 15（=槽位状态；修前量测 shots/pre_fonts_gaps.json：模型12/槽位15/请求19/健康11） */
 .hrow code{font-family:var(--mono);font-size:12px}
 .hst{margin-left:auto;font-weight:400;color:var(--muted)}
 .hst.bad{color:var(--danger-text)}
@@ -586,13 +692,13 @@ button{font:inherit}
 .side-btn svg{width:15px;height:15px;fill:currentColor;flex:none}
 /* ---------- 主区 ---------- */
 main{min-width:0;display:flex;flex-direction:column}
-.topbar{height:72px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 32px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:10}
-h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
-.top-right{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:0;flex-wrap:wrap;justify-content:flex-end}
-.status-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);font-size:13px;font-weight:600;color:var(--fg);white-space:nowrap}
-.time-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.topbar{height:var(--bar-h);flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 32px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:10}
+h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-right{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;min-width:0;flex-wrap:nowrap;justify-content:flex-end}  /* w19-A2：控件单行 nowrap + 间距收紧 */
+.status-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);font-size:13px;font-weight:600;color:var(--fg);white-space:nowrap}
+.time-chip{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:var(--surface-2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
 .time-chip svg{width:14px;height:14px;flex:none;stroke:currentColor;fill:none;stroke-width:1.4}
-.top-btn{width:auto}
+.top-btn{width:auto;padding:8px 12px}
 .lang-wrap{position:relative;display:inline-flex}
 .side-btn .lang-caret{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.8;transition:transform 120ms ease}
 #langBtn[aria-expanded=true] .lang-caret{transform:rotate(180deg)}
@@ -605,15 +711,16 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
 .content{padding:32px;display:flex;flex-direction:column;gap:24px;min-width:0;flex:1 1 auto}
 .card{background:var(--surface);border-radius:var(--r);box-shadow:var(--shadow);padding:24px;min-width:0;transition:box-shadow .15s}
 .card:hover{box-shadow:0 2px 6px rgba(16,24,40,.08),0 1px 3px rgba(16,24,40,.04)}
-.card h2{font-size:18px;font-weight:600;margin:0 0 16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2{font-size:18px;font-weight:600;margin:0 0 16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;overflow-wrap:anywhere}  /* w19-A4：卡片标题长词折行（德语） */
+.card h2>span{min-width:0;overflow-wrap:anywhere}
 .card.alert{outline:1.5px solid var(--danger-text)}
 /* KPI */
 .kpis{display:grid;grid-template-columns:1fr;gap:24px;flex:none}
 @media(min-width:560px){.kpis{grid-template-columns:repeat(2,1fr)}}
 @media(min-width:1200px){.kpis{grid-template-columns:repeat(4,1fr)}}
 .kpi{display:flex;flex-direction:column;gap:8px;padding:24px}
-.k-lbl{font-size:16px;font-weight:600;display:flex;align-items:center;justify-content:space-between;gap:8px}
-.k-lbl>span{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.k-lbl{font-size:16px;font-weight:600;display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;overflow-wrap:anywhere}  /* w19-A4：KPI 标题长词折行（Dekodiergeschwindigkeit） */
+.k-lbl>span{display:inline-flex;align-items:center;gap:8px;min-width:0;overflow-wrap:anywhere}
 .k-lbl svg{width:18px;height:18px;flex:none;stroke:var(--accent);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .k-val{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1.2;font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
 .k-num{display:inline-flex;align-items:baseline;gap:8px;white-space:nowrap}
@@ -621,7 +728,7 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
 /* w10-ⓕ 解码速度副值行；w11-ⓝ 只剩峰值：flex 布局数字/单位 flex:none 永不截断（标签可收缩），
    并用行距回收抵消行高（gap 8→3、副行/主值 line-height→1），卡高回归 w9 原高 */
 .k-sub{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:4px;line-height:1}
-.k-sub b{color:var(--fg);font-weight:600;flex:none}
+.k-sub b{color:var(--fg);font-weight:600;flex:none;font-family:var(--display)}  /* w19-B5：30m 峰值数字字体与其他主数值统一 */
 .k-sub .ks-u{flex:none}
 .k-sub .ks-l{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #kc-spd{gap:3px}
@@ -635,7 +742,8 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
 .kpi.seg-idle .mibars i{background:var(--seg-idle-bar)}
 .kpi.seg-norm .mibars i{background:var(--seg-norm-bar)}
 .kpi.seg-high .mibars i{background:var(--seg-high-bar)}
-.mibars.wait i{background:var(--track)}
+.mibars.wait i{visibility:hidden}  /* w20-⑥：迷你柱占位=一枚银灰填充框（与 .skel 同一套占位语言，用户定「银灰填充更优雅」），16 根细横线不再画 */
+.mibars.wait::before{content:'';position:absolute;inset:0;border-radius:7px;background:var(--track)}
 .mibars.wait::after{content:'';position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,var(--accent-soft),transparent);animation:shimmer 1.8s infinite}
 .badge{display:inline-flex;align-items:center;font-size:12px;font-weight:600;padding:4px 8px;border-radius:999px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .badge.up{color:var(--up-text);background:var(--up-bg)}
@@ -671,6 +779,7 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
 .kv-l2 b{color:var(--muted-2)}
 /* stat 块 */
 .stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-top:16px;flex:none}
+#c-pc .stat-row{margin-top:0}  /* w20-④：c-pc 首子元素=stat-row，h2 下沿 16 + 本行 16 叠加成 32（实测唯一离群值，其余卡 h2→内容=16）→ 归一 16；c-kv 的 stat-row 在 spark 之后，16 保留 */
 .stat{background:var(--surface-2);border-radius:16px;padding:16px;min-width:0;position:relative;overflow:hidden}
 .stat .v{font-size:17px;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums;letter-spacing:-.01em;overflow-wrap:anywhere;text-align:center}
 /* w9-F：占用率卡 3 小卡等高、标题水平对齐（badge 比纯数字高 2.5px 会把标题挤下，统一 .v 高度并垂直居中）
@@ -737,7 +846,6 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
 .foot svg{width:13px;height:13px;flex:none;stroke:var(--accent);fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 .paused *{animation-play-state:paused!important}
-@media(max-width:1559px){.topbar{height:auto;min-height:72px}}
 /* 窄屏：侧栏转顶部面板 */
 @media(max-width:1023px){
   .app{grid-template-columns:minmax(0,1fr)}
@@ -764,30 +872,34 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
   <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 3l11 6.5v13L16 29 5 22.5v-13L16 3z" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linejoin="round"/><path d="M12.5 12.5v7M19.5 12.5v7M12.5 16h7" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round"/></svg><span data-i18n="brandSide">halogen 监控</span></div>
   <div class="side-sec">
     <div class="side-title" data-i18n="modelInfo">模型信息</div>
-    <div class="model-name" id="m-name">—</div>
-    <div class="kv-row"><span data-i18n="ctxLen">上下文长度</span><b id="m-ctx">—</b></div>
-    <div class="kv-row"><span data-i18n="kvPrec">KV 缓存精度</span><b id="m-kv">—</b></div>
-    <div class="kv-row"><span data-i18n="weightFmt">权重格式</span><b id="m-fmt">—</b></div>
-    <div class="kv-row"><span data-i18n="engineVer">引擎版本</span><b id="m-ver">—</b></div>
-    <div class="kv-row"><span data-i18n="slotCount">槽位数</span><b id="m-slots">—</b></div>
+    <div class="model-name skel" id="m-name"></div>
+    <div class="kv-row"><span data-i18n="ctxLen">上下文长度</span><b id="m-ctx" class="skel sm"></b></div>
+    <div class="kv-row"><span data-i18n="kvPrec">KV 缓存精度</span><b id="m-kv" class="skel sm"></b></div>
+    <div class="kv-row"><span data-i18n="weightFmt">权重格式</span><b id="m-fmt" class="skel sm"></b></div>
+    <div class="kv-row"><span data-i18n="engineVer">引擎版本</span><b id="m-ver" class="skel sm"></b></div>
+    <div class="kv-row"><span data-i18n="slotCount">槽位数</span><b id="m-slots" class="skel sm"></b></div>
   </div>
   <div class="side-sec">
     <div class="side-title"><span data-i18n="slotState">槽位状态</span> <button class="qh" type="button" tabindex="0" aria-label="槽位状态说明" data-i18n-aria="slotStateAria" data-tip="引擎仅在推理完成时上报速度，不提供单槽位数据。展示从 1 起，后端编号从 0 起。" data-i18n-tip="slotStateTip">?</button></div>
     <div id="side-slots"></div>
+    <div class="pf-block">
+      <div class="side-title"><span data-i18n="prefillSpeed">预填充速度</span> <button class="qh" type="button" tabindex="0" aria-label="预填充速度说明" data-i18n-aria="prefillAria" data-tip="预填充速度 = prompt token 数 ÷ 预填充耗时（最近一次 prefill 突发）。引擎仅在 prefill 进行时推进这两个计数器，突发结束后保持上值；与解码速度（15 秒滑窗、空闲归零）语义不同。" data-i18n-tip="prefillTip">?</button></div>
+      <div class="kv-row pf-row"><span class="pf-l"><span data-i18n="prefillLast">最近一次</span> <code class="pf-term" data-i18n="prefillTerm">prefill</code></span><span class="pf-v"><b id="pf-tps" class="skel sm"></b><span class="pf-u">tok/s</span></span></div>
+    </div>
     <div class="qsep"></div>
     <div class="side-title"><span data-i18n="reqStatus">请求状态</span> <button class="qh" type="button" tabindex="0" aria-label="处理中说明" data-i18n-aria="inFlightAria" data-tip="处理中 = 引擎正在处理的请求数；排队请求 = 等待槽位的请求数。排队等待 = 等待≥1 秒的次数；已放弃 = 客户端断连或排队超时。" data-i18n-tip="inFlightTip">?</button></div>
     <div class="qblock" id="q-block">
-    <div class="qrow" id="q-flight-row"><span data-i18n="inFlight">处理中</span><b id="q-flight">—</b></div>
-    <div class="qrow" id="q-queued-row"><span data-i18n="queuedReq">排队请求</span><b id="q-queued">—</b></div>
-    <div class="qrow" id="q-wait-row"><span data-i18n="queueWaits">排队等待</span><span class="qnw"><b id="q-waited">—</b><span class="qu" data-i18n="timesUnit">次</span></span></div>
-    <div class="qrow" id="q-gave-row"><span data-i18n="abandoned">已放弃</span><b id="q-gave">—</b></div>
+    <div class="qrow" id="q-flight-row"><span data-i18n="inFlight">处理中</span><b id="q-flight" class="skel sm"></b></div>
+    <div class="qrow" id="q-queued-row"><span data-i18n="queuedReq">排队请求</span><b id="q-queued" class="skel sm"></b></div>
+    <div class="qrow" id="q-wait-row"><span data-i18n="queueWaits">排队等待</span><span class="qnw"><b id="q-waited" class="skel sm"></b><span class="qu" data-i18n="timesUnit">次</span></span></div>
+    <div class="qrow" id="q-gave-row"><span data-i18n="abandoned">已放弃</span><b id="q-gave" class="skel sm"></b></div>
     </div>
   </div>
   <div class="side-sec side-health">
     <div class="side-title"><span data-i18n="colHealth">采集健康</span> <button class="qh" type="button" tabindex="0" aria-label="采集健康说明" data-i18n-aria="colHealthAria" data-tip="四条采集通道（health/metrics/cache/props）本轮取数状态：绿点正常，红点异常（判异常前已自动重试）。通道异常期间，各卡片保留上一次有效数值不空白，恢复后自动更新。" data-i18n-tip="colHealthTip">?</button></div>
     <div class="hrow" data-tip="数据用于：顶栏引擎状态、槽位状态、KV 缓存池占用率&#10;（槽位数 / 处理中 / 排队请求 / 总量）" data-i18n-tip="tipHealth"><span class="dot wait" id="h-health"></span><span data-i18n="probeLiveness">活性探测</span><code>health</code><span class="hst" id="hs-health">采集中…</span></div>
     <div class="hrow" data-tip="数据用于：KPI 四卡、KV 缓存池占用率与走势、投机接受率、侧栏处理中/排队请求/排队等待/已放弃计数" data-i18n-tip="tipMetrics"><span class="dot wait" id="h-metrics"></span><span data-i18n="probeMetrics">指标采集</span><code>metrics</code><span class="hst" id="hs-metrics">采集中…</span></div>
-    <div class="hrow" data-tip="数据用于：KV 缓存池压力、Prompt 缓存" data-i18n-tip="tipCache"><span class="dot wait" id="h-cache"></span><span data-i18n="probeCache">缓存状态</span><code>cache</code><span class="hst" id="hs-cache">采集中…</span></div>
+    <div class="hrow" id="row-cache" data-tip="数据用于：KV 缓存池压力、Prompt 缓存" data-i18n-tip="tipCache"><span class="dot wait" id="h-cache"></span><span data-i18n="probeCache">缓存状态</span><code>cache</code><span class="hst" id="hs-cache">采集中…</span></div>
     <div class="hrow" data-tip="数据用于：侧栏模型信息（别名/槽位数）、待命中状态判定" data-i18n-tip="tipProps"><span class="dot wait" id="h-props"></span><span data-i18n="probeProps">引擎属性</span><code>props</code><span class="hst" id="hs-props">采集中…</span></div>
   </div>
   <div class="side-foot">
@@ -815,16 +927,16 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       <button class="side-btn top-btn" id="pauseBtn" type="button" aria-pressed="false" aria-label="暂停刷新">
         <svg id="ic-pause" viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="2" width="4" height="12" rx="1"/><rect x="9" y="2" width="4" height="12" rx="1"/></svg>
         <svg id="ic-play" viewBox="0 0 16 16" aria-hidden="true" style="display:none"><path d="M4.5 2.2v11.6a.8.8 0 0 0 1.22.68l9.1-5.8a.8.8 0 0 0 0-1.36l-9.1-5.8A.8.8 0 0 0 4.5 2.2z"/></svg>
-        <span class="btn-txt" id="pauseTxt">暂停刷新</span>
+        <span class="btn-txt" id="pauseTxt">暂停/继续</span>
       </button>
     </div>
   </header>
   <div class="content">
 
     <section class="kpis" aria-label="核心指标" data-i18n-aria="coreMetrics">
-      <div class="card kpi" id="kc-spd"><div class="k-lbl"><span><span data-i18n="decodeSpeed">解码速度</span> <button class="qh" type="button" tabindex="0" aria-label="解码速度说明" data-i18n-aria="decodeSpeedAria" data-tip="主值 = 总解码速度（实时估算）：在途请求数 × 最近一次上报的单流速度。引擎仅在请求完成时上报速度（生成进行中上报为 0），故在途产出按最近上报的单流速度估算；空闲显示 0。显示以本机带宽上限封顶。&#10;峰值 = 最近 30 分钟内总解码速度的最高值。" data-i18n-tip="decodeSpeedTip">?</button></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18a9 9 0 1 1 16 0"/><path d="M12 14l3.8-4.6"/><circle cx="12" cy="15" r="1.4"/></svg></div>
+      <div class="card kpi" id="kc-spd"><div class="k-lbl"><span><span data-i18n="decodeSpeed">解码速度</span> <button class="qh" type="button" tabindex="0" aria-label="解码速度说明" data-i18n-aria="decodeSpeedAria" data-tip="主值 = 最近 15 秒滑动窗口的总解码速度真值：窗口内产出 token 总量 ÷ 纯生成耗时 × 并发度。引擎仅在请求完成时上报产出，生成进行中保持上一窗口值；空闲超过 15 秒（窗口滑空）显示 0 并置灰，重新生成即恢复。&#10;峰值 = 最近 30 分钟内总解码速度的最高值。" data-i18n-tip="decodeSpeedTip">?</button></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18a9 9 0 1 1 16 0"/><path d="M12 14l3.8-4.6"/><circle cx="12" cy="15" r="1.4"/></svg></div>
         <div class="k-val"><span class="k-num"><span id="k-spd-v" class="skel sk-kpi"></span><span class="unit" id="k-spd-u" style="display:none">tok/s</span></span></div>
-        <div class="k-sub"><span class="ks-l" data-i18n="peak30">30m 峰值</span> <b id="k-spd-p">—</b> <span class="ks-u">tok/s</span></div>
+        <div class="k-sub"><span class="ks-l" data-i18n="peak30">30m 峰值</span> <b id="k-spd-p" class="skel sm"></b> <span class="ks-u">tok/s</span></div>
         <div class="mibars wait" id="mb-spd"></div></div>
       <div class="card kpi" id="kc-gpu"><div class="k-lbl"><span data-i18n="gpuUtil">GPU 利用率</span><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5"/><path d="M9 9.5h6M9 13h4"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg></div>
         <div class="k-val"><span class="k-num"><span id="k-gpu-v" class="skel sk-kpi"></span><span class="unit" id="k-gpu-u" style="display:none">%</span></span></div>
@@ -841,16 +953,16 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       <div class="card" id="c-kv">
         <h2><span data-i18n="kvUsage">KV 缓存池占用率</span>
           <button class="qh" type="button" tabindex="0" aria-label="KV 缓存池占用率说明" data-i18n-aria="kvUsageAria" data-tip="占用率 = KV 缓存池已用位置占比。&#10;占用率 100% 不代表过载：池满时排队为 0、冷重算为 0 是常态，引擎会按设计将内存分配至饱和。&#10;占用率下降有两种途径：① 版本替换回收（旧版本缓存被新版本替换，代价为零）② LRU 淘汰（被移出池的会话在下次请求时重新执行一次 prefill，冷重算 +1）&#10;预留 = 在途请求声明的空间需求（prompt + max_tokens，含尚未生成的部分），与已用口径独立、不计入已用" data-i18n-tip="kvUsageTip">?</button>
-          <span class="badge bad" id="kv-badge" style="display:none" data-i18n="queuing">缓存等待</span>
-          <span class="badge warn" id="kv-sleep" style="display:none" data-i18n="modelSleeping">模型待命中</span>
-          <span class="badge miss" id="kv-miss" style="display:none" data-i18n="missMetrics">metrics 数据缺失</span></h2>
+          <span class="badge bad" id="kv-badge" style="visibility:hidden" data-i18n="queuing">缓存等待</span>
+          <span class="badge warn" id="kv-sleep" style="visibility:hidden" data-i18n="modelSleeping">模型待命中</span>
+          <span class="badge miss" id="kv-miss" style="visibility:hidden" data-i18n="missMetrics">metrics 数据缺失</span></h2>
         <div class="gauge">
           <div class="gwrap" id="g-wrap">
             <svg viewBox="0 0 200 152" aria-hidden="true"><g id="g-ticks"></g></svg>
             <div class="g-center"><span class="g-num"><span id="g-num" class="skel gsk"></span><span class="unit" id="g-unit" style="display:none">%</span></span></div>
           </div>
         </div>
-        <div class="kv-used"><div class="kvl"><div><span data-i18n="used">已用</span> <b id="kv-used-t">—</b> / <span data-i18n="total">总量</span> <b id="kv-used-p">—</b></div></div><div class="kv-l2" data-tip="预留 = 在途请求声明的空间需求（prompt + max_tokens，含尚未生成的部分），与已用口径独立、不计入已用" data-i18n-tip="reservedTip"><span data-i18n="reserved">预留</span> <b id="kv-used-r">—</b></div></div>
+        <div class="kv-used"><div class="kvl"><div><span data-i18n="used">已用</span> <b id="kv-used-t" class="skel sm"></b> / <span data-i18n="total">总量</span> <b id="kv-used-p" class="skel sm"></b></div></div><div class="kv-l2" data-tip="预留 = 在途请求声明的空间需求（prompt + max_tokens，含尚未生成的部分），与已用口径独立、不计入已用" data-i18n-tip="reservedTip"><span data-i18n="reserved">预留</span> <b id="kv-used-r" class="skel sm"></b></div></div>
         <div class="sparkgrp">
           <div class="sparkbox" id="sb-kv">
             <svg class="spark" viewBox="0 0 480 72" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="gsp-kv" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--chart)" stop-opacity=".25"/><stop offset="1" stop-color="var(--chart)" stop-opacity="0"/></linearGradient></defs><path class="sa" fill="url(#gsp-kv)" stroke="none"/><path class="sl" fill="none" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/><circle class="se" r="0"/><line class="cr" y1="0" y2="72" style="display:none" stroke="var(--border-strong)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
@@ -867,16 +979,16 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       </div>
       <div class="card" id="c-pool">
         <h2><span data-i18n="poolPressure">KV 缓存池压力</span>
-          <button class="qh" type="button" tabindex="0" aria-label="KV 缓存池压力说明" data-i18n-aria="poolPressureAria" data-tip="缓存等待：正在等待 KV 缓存池腾出空间的请求数，大于 0 需立即关注；占用率不高时也可能出现：池内空间碎片化或等待槽位释放&#10;累计等待：请求为等待空间累计耗费的时间（秒），只增不减&#10;冷重算次数：旧会话被移出 KV 缓存池后重新执行 prefill 的次数，持续增长说明池容量趋于不足&#10;占位会话数：已离开但仍保留 KV 缓存占用的会话数，可随时复用&#10;快照搬移次数：缓存快照被搬移的累计次数，与冷重算次数结合观察&#10;碎片整理次数：KV 缓存池碎片整理（紧凑化）的累计次数，增长较快说明碎片较多&#10;压缩预留次数：新请求预留空间被压缩的累计次数，增长说明池内空间趋于紧张&#10;快照搬移/碎片整理/压缩预留均属 KV 缓存池空间回收机制，日常增长属正常调度行为" data-i18n-tip="poolPressureTip">?</button>
-          <span class="badge bad" id="pool-badge" style="display:none" data-i18n="queuing">缓存等待</span><span class="badge miss" id="pool-miss" style="display:none" data-i18n="missCache">cache 数据缺失</span></h2>
+          <button class="qh" type="button" tabindex="0" aria-label="KV 缓存池压力说明" data-i18n-aria="poolPressureAria" data-tip="缓存等待：正在等待 KV 缓存池腾出空间的请求数，大于 0 需立即关注；占用率不高时也可能出现：池内空间碎片化或等待槽位释放&#10;累计等待：请求为等待空间累计耗费的时间（秒），只增不减&#10;冷重算次数：旧会话被移出 KV 缓存池后重新执行 prefill 的次数，持续增长说明池容量趋于不足&#10;占位会话数：已离开但仍保留 KV 缓存占用的会话数，可随时复用&#10;快照搬移次数：缓存快照被搬移的累计次数，与冷重算次数结合观察&#10;碎片整理次数：KV 缓存池碎片整理（紧凑化）的累计次数，增长较快说明碎片较多&#10;压缩预留次数：新请求预留空间被压缩的累计次数（只压缩本轮最多输出 token 数，上下文不丢），增长说明池内空间趋于紧张&#10;快照搬移/碎片整理/压缩预留均属 KV 缓存池空间回收机制，日常增长属正常调度行为" data-i18n-tip="poolPressureTip">?</button>
+          <span class="badge bad" id="pool-badge" style="visibility:hidden" data-i18n="queuing">缓存等待</span><span class="badge miss" id="pool-miss" style="visibility:hidden" data-i18n="missCache">cache 数据缺失</span></h2>
         <div class="pgrid">
-          <div class="pitem"><div class="pname" data-i18n="queuing">缓存等待</div><div class="pval" id="pv-waiting">—</div></div>
-          <div class="pitem"><div class="pname" data-i18n="cumWait">累计等待</div><div class="pval" id="pv-waitings">—</div></div>
-          <div class="pitem"><div class="pname" data-i18n="coldRecompute">冷重算次数</div><div class="pval"><span id="pv-cold">—</span><span id="pv-cold-d" class="yellow"></span></div></div>
-          <div class="pitem"><div class="pname" data-i18n="heldSessions">占位会话数</div><div class="pval" id="pv-held">—</div></div>
-          <div class="pitem"><div class="pname" data-i18n="snapReloc">快照搬移次数</div><div class="pval"><span id="pv-loc">—</span><span id="pv-loc-d" class="yellow"></span></div></div>
-          <div class="pitem"><div class="pname" data-i18n="defrag">碎片整理次数</div><div class="pval" id="pv-packed">—</div></div>
-          <div class="pitem"><div class="pname" data-i18n="reservedCompress">压缩预留次数</div><div class="pval" id="pv-clamped">—</div></div>
+          <div class="pitem"><div class="pname" data-i18n="queuing">缓存等待</div><div class="pval skel sm" id="pv-waiting"></div></div>
+          <div class="pitem"><div class="pname" data-i18n="cumWait">累计等待</div><div class="pval skel sm" id="pv-waitings"></div></div>
+          <div class="pitem"><div class="pname" data-i18n="coldRecompute">冷重算次数</div><div class="pval"><span id="pv-cold" class="skel sm"></span><span id="pv-cold-d" class="yellow"></span></div></div>
+          <div class="pitem"><div class="pname" data-i18n="heldSessions">占位会话数</div><div class="pval skel sm" id="pv-held"></div></div>
+          <div class="pitem"><div class="pname" data-i18n="snapReloc">快照搬移次数</div><div class="pval"><span id="pv-loc" class="skel sm"></span><span id="pv-loc-d" class="yellow"></span></div></div>
+          <div class="pitem"><div class="pname" data-i18n="defrag">碎片整理次数</div><div class="pval skel sm" id="pv-packed"></div></div>
+          <div class="pitem"><div class="pname" data-i18n="reservedCompress">压缩预留次数</div><div class="pval"><span id="pv-clamped" class="skel sm"></span><span id="pv-clamped-d" class="yellow"></span></div></div>
         </div>
       </div>
     </section>
@@ -885,7 +997,7 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       <div class="card" id="c-pc">
         <h2><span data-i18n="promptCache">Prompt 缓存</span>
           <button class="qh" type="button" tabindex="0" aria-label="Prompt 缓存说明" data-i18n-aria="promptCacheAria" data-tip="Prompt 缓存与内存全景中的「磁盘读缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的磁盘读缓存（主要为模型查找表）" data-i18n-tip="promptCacheTip">?</button>
-          <span class="badge miss" id="pc-miss" style="display:none" data-i18n="missCache">cache 数据缺失</span></h2>
+          <span class="badge miss" id="pc-miss" style="visibility:hidden" data-i18n="missCache">cache 数据缺失</span></h2>
         <div class="stat-row">
           <div class="stat g"><div class="v" id="pc-hit"><span class="skel sm"></span></div><div class="lbl" data-i18n="hitRate">命中率</div></div>
           <div class="stat g"><div class="v" id="pc-thit"><span class="skel sm"></span></div><div class="lbl" data-i18n="tokenHitRate">Token 命中率</div></div>
@@ -904,20 +1016,20 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       <div class="card" id="c-pano">
         <h2><span data-i18n="memPano">内存全景</span>
           <button class="qh" type="button" tabindex="0" aria-label="内存全景说明" data-i18n-aria="memPanoAria" data-tip="六段按占用者划分，合计 = 总内存&#10;磁盘读缓存：内核文件读缓存，可随时回收，不构成负载&#10;主机内存「可用」长期保持 16–20 GiB，为引擎运行安全余量（MemAvailable 低于 16 GiB 时引擎拒绝启动），并非闲置浪费" data-i18n-tip="memPanoTip">?</button>
-          <span class="badge miss" id="pano-miss" style="display:none" data-i18n="missMem">内存数据缺失</span></h2>
+          <span class="badge miss" id="pano-miss" style="visibility:hidden" data-i18n="missMem">内存数据缺失</span></h2>
         <div class="donut" id="pano">
           <div class="prwrap">
             <svg viewBox="0 0 200 200" aria-hidden="true"><g id="pn-ticks"></g></svg>
-            <div class="donut-center"><div class="dn-num"><span id="donut-total">—</span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= GTT 内存</div></div>
+            <div class="donut-center"><div class="dn-num"><span id="donut-total" class="skel sm"></span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= GTT 内存</div></div>
           </div>
         </div>
         <div class="legend" id="pano-legend">
-          <span class="lg-item" id="lg-eng-s"><i style="background:var(--pano-eng)"></i><span data-i18n="panoEng">推理引擎（模型+KV 缓存池）</span> <b id="lg-eng">—</b></span>
-          <span class="lg-item" id="lg-proc-s"><i style="background:var(--pano-proc)"></i><span data-i18n="panoProc">其他进程</span> <b id="lg-proc">—</b></span>
-          <span class="lg-item" id="lg-kern-s"><i style="background:var(--pano-kern)"></i><span data-i18n="panoKern">内核占用</span> <b id="lg-kern">—</b></span>
-          <span class="lg-item" id="lg-read-s"><i style="background:var(--pano-read)"></i><span data-i18n="panoRead">磁盘读缓存（可回收）</span> <b id="lg-read">—</b></span>
-          <span class="lg-item" id="lg-free-s"><i style="background:var(--pano-free)"></i><span data-i18n="panoFree">空闲</span> <b id="lg-free">—</b></span>
-          <span class="lg-item" id="lg-pin-s"><i style="background:var(--pano-pin)"></i><span data-i18n="panoPin">其他驻留</span> <b id="lg-pin">—</b></span>
+          <span class="lg-item" id="lg-eng-s"><i style="background:var(--pano-eng)"></i><span data-i18n="panoEng">推理引擎（模型+KV 缓存池）</span> <b id="lg-eng" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-proc-s"><i style="background:var(--pano-proc)"></i><span data-i18n="panoProc">其他进程</span> <b id="lg-proc" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-kern-s"><i style="background:var(--pano-kern)"></i><span data-i18n="panoKern">内核占用</span> <b id="lg-kern" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-read-s"><i style="background:var(--pano-read)"></i><span data-i18n="panoRead">磁盘读缓存（可回收）</span> <b id="lg-read" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-free-s"><i style="background:var(--pano-free)"></i><span data-i18n="panoFree">空闲</span> <b id="lg-free" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-pin-s"><i style="background:var(--pano-pin)"></i><span data-i18n="panoPin">其他驻留</span> <b id="lg-pin" class="skel sm"></b></span>
         </div>
       </div>
     </section>
@@ -934,15 +1046,15 @@ var F0=function(x){return num(x,0);};
 var GiB=function(x){return (x/1073741824).toFixed(1)+' GiB';};
 var HK=['ts','in_flight','queued','kv_cache_usage_ratio','cache_bytes',
         'predicted_tokens_seconds','decode_total_tps','gpu_busy_percent','gpu_temp_c','gpu_power_w',
-        'ev_relocated','ev_cold_resorts'];
+        'ev_relocated','ev_cold_resorts','ev_room_clamped'];
 var hist=[],lastData=null,es=null,pollTimer=null,sseErr=0;
-var SPD_CAP=72;  /* w13-ⓐ：与后端 DECODE_TPS_CAP 同值；w15-合规P1-2：seed 从 /data.json 顶层 decode_cap 取后端实际值（缺省回退 72）；history 读时过滤 >cap 的陈旧尖峰（30m 峰值+迷你图+走势都跳过） */
-function capRow(r){if(r&&isNum(r.decode_total_tps)&&r.decode_total_tps>SPD_CAP){r=Object.assign({},r,{decode_total_tps:null});}return r;}
+/* w19-B1：封顶逻辑（SPD_CAP / capRow / decode_cap）彻底删除——>72 tok/s 如实显示，history 不再过滤尖峰 */
 var cacheHold={};
 var queuedHold=0,pkHold=null;  /* w10-ⓐ 排队告警保持 / w11-ⓝ 30m 峰值保持（单流副值已删） */
 var DEMO=(new URLSearchParams(location.search)).get('demo');
 function guideShort(s){if(!isNum(s.ts))return t('collecting');return s.engine_sleeping?t('shortSleep'):t('shortOff');}
 function show(el,on){el.style.display=on?'':'none';}
+function vis(el,on){el.style.visibility=on?'':'hidden';}  /* w19-A3：徽章用 visibility 切换，固定占位 → 卡片零抖动 */
 function txt(el,v){el.classList.remove('skel','lg','sm','sk-kpi','gsk');el.textContent=v;}
 function sk(el,w){el.textContent='';el.classList.remove('lg','sm','sk-kpi','gsk');el.classList.add('skel');if(w)el.classList.add(w);}
 /* w9-I：采集异常（键缺失/err 键/NaN）时数值保持——每个显示位记住最后有效值，原位保留不空白；恢复后新值顶掉旧值 */
@@ -1152,6 +1264,31 @@ function mkSideRow(){var d=document.createElement('div');d.className='slot-li';
   var nm=document.createElement('span');
   var rt=document.createElement('span');rt.className='idle-t';
   d.appendChild(dot);d.appendChild(nm);d.appendChild(rt);return d;}
+/* w18-①：slotN 模板拆三段 span——中文前后缀 .slot-nm=正文族（font-family:inherit+同灰），数字 .slot-n=mono 族。
+   四语言同步（模板 {i} 切分通用，zh/en/ko/de 无需改词条）。
+   w17 排查证据（shots/pre_fonts_gaps.json）：旧文本节点版 computed 栈与实际用字（Microsoft YaHei UI）本就与其他模块一致，
+   .slot-n 也只包数字——"中文像异体字"真因=黑色 --fg vs 其他模块中文标签 --muted 灰，前缀显式置灰根治。 */
+function slotLabel(nm,idx){
+  var pp=t('slotN',{i:'\u0001'}).split('\u0001');
+  var ns=nm.querySelector('.slot-n');
+  if(!ns){nm.textContent='';
+    var pf=document.createElement('span');pf.className='slot-nm';pf.textContent=pp[0];
+    ns=document.createElement('span');ns.className='slot-n';
+    var sf=document.createElement('span');sf.className='slot-nm';sf.textContent=pp[1]||'';
+    nm.appendChild(pf);nm.appendChild(ns);nm.appendChild(sf);}
+  else{nm.children[0].textContent=pp[0];nm.children[2].textContent=pp[1]||'';}
+  ns.textContent=idx;}
+/* w18-②：首帧占位行（数量=引擎 slots 数，未知时先占 3 行）——与真实行同结构同高（.slot-li 27.5px），
+   首帧到出数据侧栏下方模块零跳动（修前实锤：出数据后下方模块位移 90.5px，shots/pre_layout_verdict.json） */
+function slotSkel(side,k){
+  while(side.children.length>k)side.removeChild(side.lastChild);
+  while(side.children.length<k)side.appendChild(mkSideRow());
+  for(var i=0;i<k;i++){var r=side.children[i];
+    r.children[0].className='dot wait';
+    slotLabel(r.children[1],i+1);
+    var rt=r.children[2];rt.className='idle-t';
+    if(!rt.firstElementChild){rt.textContent='';var b=document.createElement('i');
+      b.className='skel sm';rt.appendChild(b);}}}
 function updSlots(s){
   var sd=s.slots_detail||[];
   var n=isNum(s.total_slots)?s.total_slots:(isNum(s.slots)?s.slots:0);
@@ -1159,6 +1296,7 @@ function updSlots(s){
   var count=sd.length?sd.length:(isNum(s.ts)?n:0);
   count=Math.min(count,1024);  /* w15-bugP1-4：钳制，⛔ 引擎畸形 total_slots 打挂页签 */
   var side=$('side-slots');
+  if(count===0&&!isNum(s.ts)){slotSkel(side,3);return;}  /* w18-②：首帧（无 ts）→ 3 占位行，⛔ 出数据后行才出现把侧栏下方顶下去 */
   if(count===0&&isNum(s.ts)){
     if(side.children.length!==1||!side.children[0].dataset.ph){
       side.textContent='';
@@ -1176,14 +1314,8 @@ function updSlots(s){
     var busy=it&&it.state==='busy';
     var sr=side.children[i];
     sr.children[0].className='dot '+(engDown?'wait':busy?'busy':'idle');
-    /* w13-ⓑ：展示编号从 1 起（后端 id/数据键仍从 0 起）；w13-ⓒ→w17-②：数字包 .slot-n=mono 等宽族，中文保持正文族 */
-    var idx=(it?it.id:i)+1;
-    var nm=sr.children[1];var pp=t('slotN',{i:'\u0001'}).split('\u0001');
-    var ns=nm.querySelector('.slot-n');
-    if(!ns){ns=document.createElement('span');ns.className='slot-n';nm.textContent='';
-      nm.appendChild(document.createTextNode(pp[0]));nm.appendChild(ns);nm.appendChild(document.createTextNode(pp[1]||''));}
-    else{nm.firstChild.textContent=pp[0];if(nm.lastChild!==ns)nm.lastChild.textContent=pp[1]||'';}
-    ns.textContent=idx;
+    /* w13-ⓑ：展示编号从 1 起（后端 id/数据键仍从 0 起）；w13-ⓒ→w17-②→w18-①：数字 .slot-n=mono 族，中文 .slot-nm=正文族 */
+    slotLabel(sr.children[1],(it?it.id:i)+1);
     var spd=(it&&isNum(it.decode_ts))?it.decode_ts.toFixed(1)+' tok/s':null;
     if(spd){sr.children[2].className='spd';sr.children[2].textContent=spd;}
     else{sr.children[2].className='idle-t';
@@ -1200,7 +1332,7 @@ var PT=[];
 function updPano(s){
   var mt=isNum(s.mem_total_gib)?s.mem_total_gib:null;
   var ok=!!(mt&&isNum(s.pano_engine_gib));
-  show($('pano-miss'),isNum(s.ts)&&!ok);
+  vis($('pano-miss'),isNum(s.ts)&&!ok);
   hv('donut-total',ok,num(mt,1),$('donut-total'),'sm');
   var gtt=isNum(s.gtt_used_gib)?num(s.gtt_used_gib,1):'—';
   var mav=isNum(s.mem_available_gib)?num(s.mem_available_gib,1):'—';
@@ -1257,16 +1389,23 @@ function render(s){
   hv('m-ver',!!s.engine_version,s.engine_version?'v'+s.engine_version:'',$('m-ver'),'sm');
   var nSlots=isNum(s.total_slots)?s.total_slots:(isNum(s.slots)?s.slots:null);
   hv('m-slots',nSlots!=null,num(nSlots)||'',$('m-slots'),'sm');
-  /* 采集健康（侧栏）：err_* 键即通道健康状态（后端已"判异常前先重试一次"） */
+  /* 采集健康（侧栏）：err_* 键即通道健康状态（后端已"判异常前先重试一次"）
+     w19-B4：cache 宽限期（1-2 拍失败）不报异常 → 中性「重试中」+ 值置灰 + tooltip 数据年龄 */
+  var cStale=!!s.cache_stale;
   var HN=[['health','err_health'],['metrics','err_metrics'],['cache','err_cache'],['props','err_props']];
   for(var hz=0;hz<HN.length;hz++){
     var hBad=!!s[HN[hz][1]],hDot=$('h-'+HN[hz][0]),hSt=$('hs-'+HN[hz][0]);
-    hDot.className='dot '+(first?'wait':hBad?'h-bad':'h-ok');
-    var hTxt=first?t('collecting'):(hBad?t('healthErr'):t('healthOk'));
+    var hWait=HN[hz][0]==='cache'&&cStale&&!hBad&&!first;
+    hDot.className='dot '+((first||hWait)?'wait':hBad?'h-bad':'h-ok');
+    var hTxt=first?t('collecting'):(hBad?t('healthErr'):(hWait?t('cacheStaleShort'):t('healthOk')));
     if(hSt.textContent!==hTxt)hSt.textContent=hTxt;
     var hCls='hst'+(hBad&&!first?' bad':'');
     if(hSt.className!==hCls)hSt.className=hCls;}
+  var cAge=isNum(s.cache_age_s)?Math.round(s.cache_age_s):null;
+  $('row-cache').setAttribute('data-tip',cStale?t('cacheStaleTip',{n:cAge===null?'—':cAge}):t('tipCache'));
   updSlots(s);
+  /* w19-B3：预填充速度（后端 prefill_tps 已 hold 最近一次突发值；无史显示骨架） */
+  hv('pf-tps',isNum(s.prefill_tps),num(s.prefill_tps,1),$('pf-tps'),'sm');
   /* 侧栏 在途/排队 + 等待/放弃（w9-I：保持） */
   function qSet(el,v){hv(el.id,isNum(v),num(v),el,'sm');}
   qSet($('q-flight'),s.in_flight);qSet($('q-queued'),s.queued);
@@ -1282,11 +1421,12 @@ function render(s){
       :t('waitTipUnknown'));
   /* KPI 四卡（w11-ⓕ2：解码速度主值=在途请求数×最近上报单流速度（后端实时估算）；w11-ⓝ：副值只剩 30m 峰值） */
   kpiCard('spd',s.decode_total_tps,function(x){return x.toFixed(1);},segSpd,H,'decode_total_tps');
+  if(s.decode_idle)$('k-spd-v').classList.add('stale');  /* w20-①：空闲滑空=0.0+置灰（kpiCard 内 fresh=0.0 为真不会置灰，此处补） */
   var pkEl=$('k-spd-p');
   var pk=null;
   for(var pi=Math.max(0,H.length-1800);pi<H.length;pi++){var pv=H[pi].decode_total_tps;if(isNum(pv)&&(pk===null||pv>pk))pk=pv;}
   if(pk!==null)pkHold=pk;
-  pkEl.textContent=(pkHold!==null)?pkHold.toFixed(1):'—';
+  if(pkHold!==null)txt(pkEl,pkHold.toFixed(1));else sk(pkEl,'sm');  /* w20-⑥：峰值占位=skel 银灰填充框（原「—」横线，统一占位语言） */
   pkEl.classList.toggle('stale',!isNum(s.decode_total_tps));  /* w10-ⓖ */
   kpiCard('gpu',s.gpu_busy_percent,F0,segBusy,H,'gpu_busy_percent');
   kpiCard('temp',s.gpu_temp_c,F0,segTemp,H,'gpu_temp_c');
@@ -1300,10 +1440,10 @@ function render(s){
   var r=isNum(s.kv_cache_usage_ratio)?s.kv_cache_usage_ratio:null;
   var wKnown=isNum(s.kv_pool_waiting_for_room);
   var w=(s.kv_pool_waiting_for_room||0)>0;
-  show($('kv-badge'),w);
-  show($('kv-sleep'),sleeping);
+  vis($('kv-badge'),w);
+  vis($('kv-sleep'),sleeping);
   $('kv-miss').textContent=first?t('collecting'):t('missMetrics');
-  show($('kv-miss'),!first&&r==null);
+  vis($('kv-miss'),!first&&r==null);
   $('c-kv').classList.toggle('alert',!!w);
   var kq=$('kv-queue');
   if(!wKnown){  /* w9-I：断供保持最后排队状态（卡头 miss 徽标与采集健康区照常如实显示） */
@@ -1318,26 +1458,30 @@ function render(s){
   var cKnown=isNum(s.cache_waiting_for_room);
   var pw=(cval(s,'cache_waiting_for_room')||0)>0;
   $('c-pool').classList.toggle('alert',!!pw);
-  show($('pool-badge'),pw);
+  vis($('pool-badge'),pw);
   $('pool-miss').textContent=first?t('collecting'):t('missCache');
-  show($('pool-miss'),!cKnown);
-  pvSet($('pv-waiting'),cval(s,'cache_waiting_for_room'),pw?'pval red':'pval');
-  pvSet($('pv-waitings'),cval(s,'cache_waiting_s'),'pval',function(x){return num(x,1)+t('secUnit');});
-  var evR=sumLast(H,'ev_relocated',60),evC=sumLast(H,'ev_cold_resorts',60);
-  pvSet($('pv-cold'),cval(s,'cache_cold_resorts'),evC>0?'yellow':'');
+  vis($('pool-miss'),!cKnown);
+  var pvStale=cStale?' stale':'';  /* w19-B4：cache 宽限期保持上值并置灰 */
+  pvSet($('pv-waiting'),cval(s,'cache_waiting_for_room'),(pw?'pval red':'pval')+pvStale);
+  pvSet($('pv-waitings'),cval(s,'cache_waiting_s'),'pval'+pvStale,function(x){return num(x,1)+t('secUnit');});
+  var evR=sumLast(H,'ev_relocated',60),evC=sumLast(H,'ev_cold_resorts',60),evL=sumLast(H,'ev_room_clamped',60);
+  pvSet($('pv-cold'),cval(s,'cache_cold_resorts'),(evC>0?'yellow':'')+pvStale);
   $('pv-cold-d').textContent=evC>0?' (+'+evC+')':'';
-  pvSet($('pv-held'),cval(s,'cache_held_regions'),'pval');
-  pvSet($('pv-loc'),cval(s,'cache_relocated'),'pval');
+  pvSet($('pv-held'),cval(s,'cache_held_regions'),'pval'+pvStale);
+  pvSet($('pv-loc'),cval(s,'cache_relocated'),'pval'+pvStale);
   $('pv-loc-d').textContent=evR>0?' (+'+evR+')':'';
-  pvSet($('pv-packed'),cval(s,'cache_packed'),'pval');
-  pvSet($('pv-clamped'),cval(s,'cache_room_clamped'),'pval');
+  pvSet($('pv-packed'),cval(s,'cache_packed'),'pval'+pvStale);
+  pvSet($('pv-clamped'),cval(s,'cache_room_clamped'),(evL>0?'yellow':'')+pvStale);  /* w20-追加A：与冷重算/快照搬移同构同色=60s 黄色增量 */
+  $('pv-clamped-d').textContent=evL>0?' (+'+evL+')':'';
   /* Prompt 缓存：命中/token/大小/条目 + 走势 */
   $('pc-miss').textContent=first?t('collecting'):t('missCache');
-  show($('pc-miss'),!!s.err_cache&&!first);
+  vis($('pc-miss'),!!s.err_cache&&!first);
   hv('pc-hit',isNum(s.cache_hit_rate),isNum(s.cache_hit_rate)?(s.cache_hit_rate*100).toFixed(1)+'%':'',$('pc-hit'),'sm');
   hv('pc-thit',isNum(s.cache_token_hit_rate),isNum(s.cache_token_hit_rate)?(s.cache_token_hit_rate*100).toFixed(1)+'%':'',$('pc-thit'),'sm');
   hv('pc-size',isNum(s.cache_bytes),isNum(s.cache_bytes)?(s.cache_bytes/1073741824).toFixed(1)+' GiB':'',$('pc-size'),'sm');
   hv('pc-ent',isNum(s.cache_entries)&&isNum(s.cache_max_entries),isNum(s.cache_entries)&&isNum(s.cache_max_entries)?num(s.cache_entries)+'/'+num(s.cache_max_entries):'',$('pc-ent'),'sm');
+  var pcStaleEls=['pc-hit','pc-thit','pc-size','pc-ent'];
+  for(var pcs=0;pcs<pcStaleEls.length;pcs++)$(pcStaleEls[pcs]).classList.toggle('stale',cStale);
   $('pc-ent-s').setAttribute('data-tip',
     isNum(s.cache_superseded)
       ?t('entTipKnown',{n:num(s.cache_superseded)})
@@ -1361,14 +1505,13 @@ function mergeRows(rows){var lastT=hist.length?hist[hist.length-1].ts:0;
   for(var i=0;i<rows.length;i++){var r=rows[i];
     if(!r||!isNum(r.ts))continue;
     if(lastT&&r.ts<lastT-5){hist=[];lastT=0;}  /* w15-bugP1-5：ts 回退 >5s（NTP 向后校时/手动改时）→ 清空 hist 重建，⛔ 停摆等追平 */
-    if(r.ts>lastT){hist.push(capRow(r));lastT=r.ts;}}  /* w13-ⓐ：入 hist 前滤 >cap 尖峰 */
+    if(r.ts>lastT){hist.push(r);lastT=r.ts;}}
   while(hist.length>1800)hist.shift();}
 function frame(d){if(d.history)mergeRows(d.history);var s=d.latest||{};
   if(isNum(s.ts))mergeRows([pickRow(s)]);render(s);}
 var lastFrame=0,lastTry=0,esGrace=0,missCount=0;
 function seed(){return fetch('/data.json').then(function(r){return r.json();}).then(function(d){
-    if(isNum(d.decode_cap)&&d.decode_cap>0)SPD_CAP=d.decode_cap;  /* w15-合规P1-2：前端 cap 跟随后端 DASH_DECODE_CAP，缺省回退 72 */
-    lastFrame=Date.now();hist=(d.history||[]).slice(-1800).map(capRow);render(d.latest||{});})  /* w13-ⓐ：读时过滤 >cap 陈旧尖峰 */
+    lastFrame=Date.now();hist=(d.history||[]).slice(-1800);render(d.latest||{});})
   .catch(function(){$('sub').textContent=t('connRetry');$('dot').className='dot off';});}
 function isPaused(){return document.body.classList.contains('paused');}
 function connect(){
@@ -1396,7 +1539,7 @@ setInterval(function(){
 $('pauseBtn').addEventListener('click',function(){
   var paused=document.body.classList.toggle('paused');
   this.setAttribute('aria-pressed',paused?'true':'false');
-  $('pauseTxt').textContent=paused?t('resumeUpdates'):t('pauseUpdates');
+  $('pauseTxt').textContent=t('pauseResume');  /* w19-A2：单行固定文案 Pause/Resume，⛔ 随状态变长变短 */
   this.setAttribute('aria-label',paused?t('resumeUpdates'):t('pauseUpdates'));
   $('ic-pause').style.display=paused?'none':'';
   $('ic-play').style.display=paused?'':'none';
@@ -1435,10 +1578,10 @@ var I18N={
  tipCache:'数据用于：KV 缓存池压力、Prompt 缓存',
  tipProps:'数据用于：侧栏模型信息（别名/槽位数）、待命中状态判定',
   themeAria:'切换亮色/暗色主题',themeDark:'暗色',themeLight:'亮色',overviewH1:'推理监控总览',
- connecting:'连接中…',loading:'加载中…',pauseUpdates:'暂停刷新',resumeUpdates:'恢复刷新',
+ connecting:'连接中…',loading:'加载中…',pauseUpdates:'暂停刷新',resumeUpdates:'恢复刷新',pauseResume:'暂停/继续',
  langSwitchAria:'切换语言',coreMetrics:'核心指标',
-  decodeSpeed:'解码速度',decodeSpeedAria:'解码速度说明',peak30:'30m 峰值',
-   decodeSpeedTip:`主值 = 总解码速度（实时估算）：在途请求数 × 最近一次上报的单流速度。引擎仅在请求完成时上报速度（生成进行中上报为 0），故在途产出按最近上报的单流速度估算；空闲显示 0。显示以本机带宽上限封顶。
+  decodeSpeed:'解码速度',decodeSpeedAria:'解码速度说明',peak30:'30m 峰值',prefillSpeed:'预填充速度',prefillLast:'最近一次',prefillTerm:'prefill',prefillAria:'预填充速度说明',prefillTip:'预填充速度 = prompt token 数 ÷ 预填充耗时（最近一次 prefill 突发）。引擎仅在 prefill 进行时推进这两个计数器，突发结束后保持上值；与解码速度（15 秒滑窗、空闲归零）不同，本模块语义为「最近一次」。',
+   decodeSpeedTip:`主值 = 最近 15 秒滑动窗口的总解码速度真值：窗口内产出 token 总量 ÷ 纯生成耗时 × 并发度。引擎仅在请求完成时上报产出，生成进行中保持上一窗口值；空闲超过 15 秒（窗口滑空）显示 0 并置灰，重新生成即恢复。
   峰值 = 最近 30 分钟内总解码速度的最高值。`,
  gpuUtil:'GPU 利用率',gpuTemp:'GPU 温度',gpuPower:'GPU 功耗',gpuPowerAria:'GPU 功耗说明',
  gpuPowerTip:'均衡模式 85 W 为 LLM 推理的最佳功耗区间，120 W 性能模式对推理性能的提升仅约 2%。',
@@ -1458,7 +1601,7 @@ var I18N={
 占位会话数：已离开但仍保留 KV 缓存占用的会话数，可随时复用
 快照搬移次数：缓存快照被搬移的累计次数，与冷重算次数结合观察
 碎片整理次数：KV 缓存池碎片整理（紧凑化）的累计次数，增长较快说明碎片较多
-压缩预留次数：新请求预留空间被压缩的累计次数，增长说明池内空间趋于紧张
+压缩预留次数：新请求预留空间被压缩的累计次数（只压缩本轮最多输出 token 数，上下文不丢），增长说明池内空间趋于紧张
 快照搬移/碎片整理/压缩预留均属 KV 缓存池空间回收机制，日常增长属正常调度行为`,
  missCache:'cache 数据缺失',cumWait:'累计等待',coldRecompute:'冷重算次数',heldSessions:'占位会话数',
  snapReloc:'快照搬移次数',defrag:'碎片整理次数',reservedCompress:'压缩预留次数',
@@ -1477,7 +1620,7 @@ var I18N={
  shortSleep:'待命中',shortOff:'等待引擎恢复',collecting:'采集中…',
  noSlotData:'暂无槽位数据，恢复后自动出现',slotN:'槽位 {i}',slotOffline:'离线',slotGenerating:'生成中',slotIdle:'空闲',
  engineRunning:'引擎运行中',engineNotResp:'引擎未响应',lastUpdated:'最后更新 {t}',
- healthErr:'异常',healthOk:'正常',
+ healthErr:'异常',healthOk:'正常',cacheStaleShort:'缓存重试中',cacheStaleTip:'cache 通道本轮取数失败，已保持上一次有效值（数据年龄 {n} 秒）；连续 3 次失败才判异常',
  waitTipKnown:'排队等待≥1 秒共 {n} 次 / 累计 {s} 秒；已放弃 = 客户端断连或排队超时',
  waitTipUnknown:'排队等待≥1 秒的次数与累计时间（秒）；已放弃 = 客户端断连或排队超时',
  dataMissing:'数据缺失',noQueue:'无排队',
@@ -1508,10 +1651,10 @@ var I18N={
  tipCache:'Data Feeds: KV Cache Pool Pressure, Prompt Cache',
  tipProps:'Data Feeds: Sidebar Model Info (Alias/Slot Count), Sleeping State Detection',
   themeAria:'Switch Light/Dark Theme',themeDark:'Dark',themeLight:'Light',overviewH1:'Inference Monitoring Overview',
- connecting:'Connecting…',loading:'Loading…',pauseUpdates:'Pause Updates',resumeUpdates:'Resume Updates',
+ connecting:'Connecting…',loading:'Loading…',pauseUpdates:'Pause Updates',resumeUpdates:'Resume Updates',pauseResume:'Pause/Resume',
  langSwitchAria:'Switch Language',coreMetrics:'Core Metrics',
-   decodeSpeed:'Decode Speed',decodeSpeedAria:'Decode Speed Explanation',peak30:'30m peak',
-    decodeSpeedTip:`Main = Total Decode Speed (real-time estimate): In-Flight Requests × the most recently reported single-stream speed. The engine reports speed only when a request completes (it reports 0 while generating), so in-flight output is estimated at the latest reported single-stream speed; shows 0 when idle. Display is capped at the local bandwidth ceiling.
+   decodeSpeed:'Decode Speed',decodeSpeedAria:'Decode Speed Explanation',peak30:'30m peak',prefillSpeed:'Prefill Speed',prefillLast:'Latest',prefillTerm:'prefill',prefillAria:'Prefill Speed Explanation',prefillTip:'Prefill Speed = prompt tokens / prefill time (most recent prefill burst). The engine advances both counters only while a prefill runs; after the burst ends the last value is held. Unlike Decode Speed (15 s sliding window, drops to 0 when idle), this module shows the most recent burst.',
+    decodeSpeedTip:`Main = true total decode speed over the last 15-second sliding window: tokens produced in the window ÷ pure generation time × concurrency. The engine reports output only when a request completes, and holds the last window value while generation is in progress; after more than 15 s idle (window empty) it shows 0 grayed out, and recovers as soon as generation resumes.
    Peak = highest total decode speed over the last 30 min.`,
   gpuUtil:'GPU Utilization',gpuTemp:'GPU Temperature',gpuPower:'GPU Power',gpuPowerAria:'GPU Power Explanation',
   gpuPowerTip:'Balanced Mode 85 W Is the Optimal Power Range for LLM Inference; 120 W Performance Mode Improves Inference Performance by Only ~2%.',
@@ -1531,7 +1674,7 @@ var I18N={
  Held Session Count: Sessions That Have Left but Still Hold KV Cache Occupancy; Reusable Anytime
  Snapshot Relocation Count: Cumulative Times Cache Snapshots Were Relocated; Observe Together with Cold Recompute Count
  Defragment Count: Cumulative KV Cache Pool Defragmentation (Compaction) Runs; Fast Growth Indicates Fragmentation
- Reserved Compression Count: Cumulative Times New-Request Reserved Space Was Compressed; Growth Indicates Pool Space Tightening
+  Reserved Compression Count: Cumulative Times New-Request Reserved Space Was Compressed (Only This Round's Maximum Output Token Count Is Trimmed; the Context Is Not Lost); Growth Indicates Pool Space Tightening
  Snapshot Relocation/Defragment/Reserved Compression Are All KV Cache Pool Space-Reclaim Mechanisms; Daily Growth Is Normal Scheduling Behavior`,
  missCache:'Cache Data Unavailable',cumWait:'Cumulative Wait',coldRecompute:'Cold Recompute Count',heldSessions:'Held Session Count',
  snapReloc:'Snapshot Relocation Count',defrag:'Defragment Count',reservedCompress:'Reserved Compression Count',
@@ -1550,7 +1693,7 @@ var I18N={
  shortSleep:'Sleeping',shortOff:'Waiting for Engine Recovery',collecting:'Collecting…',
   noSlotData:'No Slot Data Yet; It Reappears Automatically after Recovery',slotN:'Slot {i}',slotOffline:'Offline',slotGenerating:'Generating',slotIdle:'Idle',
   engineRunning:'Engine Running',engineNotResp:'Engine Not Responding',lastUpdated:'Last Updated {t}',
-  healthErr:'Error',healthOk:'OK',
+  healthErr:'Error',healthOk:'OK',cacheStaleShort:'Retrying',cacheStaleTip:'Cache channel failed this round; last valid values are held (data age {n} s). Flagged as an error only after 3 consecutive failures.',
   waitTipKnown:'Queue Waits ≥1 s: {n} Times / Cumulative {s} s; Abandoned = Client Disconnect or Queue Timeout',
   waitTipUnknown:'Count of Queue Waits ≥1 s and Cumulative Time (Seconds); Abandoned = Client Disconnect or Queue Timeout',
   dataMissing:'Data Unavailable',noQueue:'No Queue',
@@ -1581,10 +1724,10 @@ var I18N={
  tipCache:'데이터 사용처: KV 캐시 풀 압력, Prompt 캐시',
  tipProps:'데이터 사용처: 사이드바 모델 정보(별칭/슬롯 수), 절전 상태 판정',
   themeAria:'라이트/다크 테마 전환',themeDark:'다크',themeLight:'라이트',overviewH1:'추론 모니터링 개요',
- connecting:'연결 중…',loading:'불러오는 중…',pauseUpdates:'갱신 일시정지',resumeUpdates:'갱신 재개',
+ connecting:'연결 중…',loading:'불러오는 중…',pauseUpdates:'갱신 일시정지',resumeUpdates:'갱신 재개',pauseResume:'일시정지/재개',
  langSwitchAria:'언어 전환',coreMetrics:'핵심 지표',
-   decodeSpeed:'디코딩 속도',decodeSpeedAria:'디코딩 속도 설명',peak30:'30분 최고',
-    decodeSpeedTip:`주 값 = 총 디코딩 속도(실시간 추정): 진행 중인 요청 수 × 마지막으로 보고된 단일 스트림 속도. 엔진은 요청 완료 시에만 속도를 보고하므로(생성 중에는 0 보고) 진행 중인 산출물은 마지막 보고된 단일 스트림 속도로 추정되며, 유휴 시 0을 표시합니다. 표시는 이 머신의 대역폭 상한으로 제한됩니다.
+   decodeSpeed:'디코딩 속도',decodeSpeedAria:'디코딩 속도 설명',peak30:'30분 최고',prefillSpeed:'프리필 속도',prefillLast:'최근',prefillTerm:'프리필',prefillAria:'프리필 속도 설명',prefillTip:'프리필 속도 = prompt 토큰 수 / 프리필 소요 시간(최근 프리필 버스트). 엔진은 프리필 진행 중에만 두 카운터를 증가시키며, 버스트가 끝나면 마지막 값을 유지합니다. 디코딩 속도(15초 슬라이딩 윈도우, 유휴 시 0으로 복귀)와 달리 이 모듈은 최근 한 번의 값을 유지합니다.',
+    decodeSpeedTip:`주 값 = 최근 15초 슬라이딩 윈도우의 총 디코딩 속도 실제값: 윈도우 내 생성 토큰 총량 / 순수 생성 시간 × 동시성. 엔진은 요청 완료 시에만 산출물을 보고하므로 생성 중에는 마지막 윈도우 값을 유지하며, 15초 이상 유휴(윈도우 소멸)하면 0이 회색으로 표시되고 생성을 재개하면 즉시 복구됩니다.
    최고값 = 최근 30분 총 디코딩 속도 중 최고치.`,
  gpuUtil:'GPU 사용률',gpuTemp:'GPU 온도',gpuPower:'GPU 전력',gpuPowerAria:'GPU 전력 설명',
  gpuPowerTip:'균형 모드 85 W는 LLM 추론의 최적 전력 구간이며, 120 W 성능 모드는 추론 성능을 약 2%만 향상시킵니다.',
@@ -1604,7 +1747,7 @@ var I18N={
 점유 세션 수: 떠났지만 KV 캐시 점유를 유지하는 세션 수, 언제든 재사용 가능
 스냅샷 이동 수: 캐시 스냅샷이 이동된 누적 횟수, 콜드 재계산 수와 함께 관찰
 단편화 정리 수: KV 캐시 풀 단편화 정리(압축) 누적 횟수, 빠르게 증가하면 단편화가 많은 것
-예약 압축 수: 새 요청 예약 공간이 압축된 누적 횟수, 증가는 풀 공간이 촉박해짐을 의미
+ 예약 압축 수: 새 요청 예약 공간이 압축된 누적 횟수(이번 라운드의 최대 출력 토큰 수만 줄이며 컨텍스트는 손실되지 않음), 증가는 풀 공간이 촉박해짐을 의미
 스냅샷 이동/단편화 정리/예약 압축은 모두 KV 캐시 풀 공간 회수 메커니즘으로, 일상적 증가는 정상 스케줄링 동작입니다`,
  missCache:'cache 데이터 없음',cumWait:'누적 대기',coldRecompute:'콜드 재계산 수',heldSessions:'점유 세션 수',
  snapReloc:'스냅샷 이동 수',defrag:'단편화 정리 수',reservedCompress:'예약 압축 수',
@@ -1623,7 +1766,7 @@ var I18N={
  shortSleep:'절전',shortOff:'엔진 복구 대기',collecting:'수집 중…',
  noSlotData:'슬롯 데이터 없음, 복구 후 자동으로 표시됩니다',slotN:'슬롯 {i}',slotOffline:'오프라인',slotGenerating:'생성 중',slotIdle:'유휴',
  engineRunning:'엔진 실행 중',engineNotResp:'엔진 응답 없음',lastUpdated:'마지막 갱신 {t}',
- healthErr:'오류',healthOk:'정상',
+ healthErr:'오류',healthOk:'정상',cacheStaleShort:'재시도 중',cacheStaleTip:'cache 채널이 이번 라운드 수집에 실패하여 마지막 유효 값을 유지합니다(데이터 경과 {n}초). 연속 3회 실패 시에만 오류로 판정합니다.',
  waitTipKnown:'1초 이상 대기열 대기 {n}회 / 누적 {s}초; 포기 = 클라이언트 연결 끊김 또는 대기열 시간 초과',
  waitTipUnknown:'1초 이상 대기열 대기 횟수와 누적 시간(초); 포기 = 클라이언트 연결 끊김 또는 대기열 시간 초과',
  dataMissing:'데이터 없음',noQueue:'대기열 없음',
@@ -1654,10 +1797,10 @@ var I18N={
  tipCache:'Daten für: KV-Cache-Pool-Druck, Prompt-Cache',
  tipProps:'Daten für: Modellinfo der Seitenleiste (Alias/Slotanzahl), Schlafzustand-Erkennung',
   themeAria:'Helles/dunkles Theme wechseln',themeDark:'Dunkel',themeLight:'Hell',overviewH1:'Inferenz-Überwachungsübersicht',
- connecting:'Verbindung…',loading:'Lädt…',pauseUpdates:'Aktualisierung pausieren',resumeUpdates:'Aktualisierung fortsetzen',
+ connecting:'Verbindung…',loading:'Lädt…',pauseUpdates:'Aktualisierung pausieren',resumeUpdates:'Aktualisierung fortsetzen',pauseResume:'Pause/Fortsetzen',
  langSwitchAria:'Sprache wechseln',coreMetrics:'Kernmetriken',
-   decodeSpeed:'Dekodiergeschwindigkeit',decodeSpeedAria:'Erklärung zur Dekodiergeschwindigkeit',peak30:'30m Spitze',
-    decodeSpeedTip:`Hauptwert = Gesamte Dekodiergeschwindigkeit (Echtzeit-Schätzung): Laufende Anfragen × zuletzt berichtete Einzelstrom-Geschwindigkeit. Die Engine berichtet die Geschwindigkeit nur bei Abschluss einer Anfrage (während der Generierung wird 0 berichtet); laufende Ausgaben werden daher mit der zuletzt berichteten Einzelstrom-Geschwindigkeit geschätzt; im Leerlauf 0. Die Anzeige ist durch die lokale Bandbreiten-Obergrenze begrenzt.
+   decodeSpeed:'Dekodiergeschwindigkeit',decodeSpeedAria:'Erklärung zur Dekodiergeschwindigkeit',peak30:'30m Spitze',prefillSpeed:'Prefill-Geschwindigkeit',prefillLast:'Letzter',prefillTerm:'Prefill',prefillAria:'Erklärung zur Prefill-Geschwindigkeit',prefillTip:'Prefill-Geschwindigkeit = Prompt-Token / Prefill-Zeit (letzter Prefill-Burst). Die Engine erhöht beide Zähler nur während eines Prefills; nach dem Burst bleibt der letzte Wert stehen. Im Unterschied zur Dekodiergeschwindigkeit (15-Sekunden-Gleitfenster, fällt im Leerlauf auf 0) zeigt dieses Modul den letzten Durchlauf.',
+    decodeSpeedTip:`Hauptwert = Ist-Gesamtgeschwindigkeit der Dekodierung über das letzte 15-Sekunden-Gleitfenster: im Fenster erzeugte Token ÷ reine Generierungszeit × Parallelität. Die Engine meldet Ausgaben nur bei Abschluss einer Anfrage; während der Generierung wird der letzte Fensterwert gehalten. Nach über 15 s Leerlauf (Fenster leer) wird 0 ausgegraut angezeigt; bei neuer Generierung sofort wieder hergestellt.
    Spitze = höchste Gesamtdekodiergeschwindigkeit der letzten 30 min.`,
  gpuUtil:'GPU-Auslastung',gpuTemp:'GPU-Temperatur',gpuPower:'GPU-Leistung',gpuPowerAria:'Erklärung zur GPU-Leistung',
  gpuPowerTip:'Der Ausgewogenheitsmodus 85 W ist der optimale Leistungsbereich für LLM-Inferenz; der Leistungsmodus 120 W verbessert die Inferenzleistung nur um ~2%.',
@@ -1677,7 +1820,7 @@ Kalt-Neuberechnungen: Male, die alte Sitzungen nach der Verdrängung aus dem KV-
 Haltende Sitzungen: Sitzungen, die gegangen sind, aber KV-Cache-Belegung behalten; jederzeit wiederverwendbar
 Snapshot-Umzüge: Kumulative Male, die Cache-Snapshots verschoben wurden; zusammen mit Kalt-Neuberechnungen beobachten
 Fragmentierungs-Bereinigungen: Kumulative Male der KV-Cache-Pool-Defragmentierung (Komprimierung); schnelles Wachstum deutet auf Fragmentierung hin
-Reservierungs-Komprimierungen: Kumulative Male, in denen reservierter Platz neuer Anfragen komprimiert wurde; Wachstum deutet auf knappen Pool-Platz hin
+ Reservierungs-Komprimierungen: Kumulative Male, in denen reservierter Platz neuer Anfragen komprimiert wurde (nur die maximale Ausgabe-Token-Zahl der laufenden Runde wird reduziert; der Kontext geht nicht verloren); Wachstum deutet auf knappen Pool-Platz hin
 Snapshot-Umzüge/Fragmentierungs-Bereinigungen/Reservierungs-Komprimierungen sind Mechanismen zur Platzrückgewinnung des KV-Cache-Pools; alltägliches Wachstum ist normales Scheduling`,
  missCache:'cache-Daten nicht verfügbar',cumWait:'Kumulative Wartezeit',coldRecompute:'Kalt-Neuberechnungen',heldSessions:'Haltende Sitzungen',
  snapReloc:'Snapshot-Umzüge',defrag:'Fragmentierungs-Bereinigungen',reservedCompress:'Reservierungs-Komprimierungen',
@@ -1696,7 +1839,7 @@ Der "verfügbare" Hauptspeicher bleibt dauerhaft bei 16–20 GiB als Sicherheits
  shortSleep:'Schlafmodus',shortOff:'Warten auf Engine-Erholung',collecting:'Erfassung…',
  noSlotData:'Keine Slot-Daten; erscheinen nach der Wiederherstellung automatisch',slotN:'Slot {i}',slotOffline:'Offline',slotGenerating:'Generierung',slotIdle:'Leerlauf',
  engineRunning:'Engine läuft',engineNotResp:'Engine antwortet nicht',lastUpdated:'Zuletzt aktualisiert {t}',
- healthErr:'Fehler',healthOk:'OK',
+ healthErr:'Fehler',healthOk:'OK',cacheStaleShort:'Wiederholung',cacheStaleTip:'Der cache-Kanal konnte in dieser Runde nicht abgefragt werden; die letzten gültigen Werte bleiben stehen (Datenalter {n} s). Erst nach 3 aufeinanderfolgenden Fehlern wird dies als Fehler gemeldet.',
  waitTipKnown:'Warten ≥1 s: {n} Mal / kumuliert {s} s; Aufgegeben = Client-Trennung oder Warteschlangen-Timeout',
  waitTipUnknown:'Anzahl der Wartefälle ≥1 s und kumulative Zeit (Sekunden); Aufgegeben = Client-Trennung oder Warteschlangen-Timeout',
  dataMissing:'Daten nicht verfügbar',noQueue:'Keine Warteschlange',
@@ -1728,7 +1871,7 @@ function applyLang(){
   var dark=document.documentElement.getAttribute('data-theme')==='dark';
   $('themeTxt').textContent=t(dark?'themeLight':'themeDark');
   var paused=document.body.classList.contains('paused');
-  $('pauseTxt').textContent=paused?t('resumeUpdates'):t('pauseUpdates');
+  $('pauseTxt').textContent=t('pauseResume');  /* w19-A2：单行固定文案 Pause/Resume，⛔ 随状态变长变短 */
   $('pauseBtn').setAttribute('aria-label',paused?t('resumeUpdates'):t('pauseUpdates'));
   hideTip();tipEl.textContent='';
   if(lastData)render(lastData);
@@ -1769,7 +1912,7 @@ applyTheme(_st);
 applyLang();
 gaugeInkCenter();
 if(DEMO){render({});}
-else{seed();connect();}
+else{slotSkel($('side-slots'),3);seed();connect();}  /* w18-②：启动即渲染 3 首帧占位行（demo 态不占，⛔ 破坏 demo=empty/sleep） */
 </script>
 </body>
 </html>
@@ -1891,7 +2034,6 @@ class Handler(BaseHTTPRequestHandler):
                     "history": list(_history),
                     "interval": INTERVAL,
                     "window_min": round(HISTORY_LEN * INTERVAL / 60),
-                    "decode_cap": DECODE_TPS_CAP,  # w15-合规P1-2：顶层下发封顶值供前端 SPD_CAP 对齐（history 行键契约不动）
                 }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             extra = ()
