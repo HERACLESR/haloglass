@@ -1,13 +1,11 @@
 <!-- Working title: `halogen-dashboard`. Once the final name is decided, perform a GLOBAL replace -->
 <!-- across README.md / README.zh-CN.md / LICENSE / CONTRIBUTING.md. -->
 
-# halogen-dashboard (working title)
+# halogen-dashboard
 
 **English** | [简体中文](README.zh-CN.md)
 
-> A single-file, read-only monitoring dashboard for a local [halogen] inference engine — GPU, memory, KV cache, slots, queueing and decode speed at a glance. No database, no build step, no agent on the engine.
-
-*(halogen: the inference engine being monitored. Replace with a link once the engine's public name/repo is settled.)*
+> A single-file, read-only monitoring dashboard for a local halogen inference engine — GPU, memory, KV cache, slots, queueing and decode speed at a glance. No database, no build step, no agent on the engine.
 
 ## Screenshots
 
@@ -31,10 +29,13 @@ Full-page view, light theme (1440 px wide). The image links to the [dark theme](
 
 ```bash
 python3 dash.py
+# halogen-dash listening on http://127.0.0.1:8873
 # then open http://127.0.0.1:8873
 ```
 
 The dashboard expects the engine at `127.0.0.1:8899` (override with `DASH_ENGINE_URL`). If port 8873 is busy it automatically falls back through 8879 and prints the actual port on stdout.
+
+No engine running? You can still see the UI: open `http://127.0.0.1:8873/?demo=sleep` (or `?demo=empty`) to preview the sleeping-model / empty state.
 
 ### Configuration
 
@@ -45,8 +46,8 @@ All settings are environment variables. They can also live in an optional `dash.
 | `DASH_ENGINE_URL` | `http://127.0.0.1:8899` | Engine base URL (accessed with `GET` only) |
 | `DASH_ENGINE_PROC` | `flash_serve` | Engine process-name marker, used to attribute engine memory in the panorama |
 | `DASH_BINDS` | `127.0.0.1` | Comma-separated bind addresses |
-| `DASH_ALLOWED_HOSTS` | *(empty)* | Extra `Host` header whitelist entries (comma-separated); bound addresses are allowed automatically |
-| `DASH_CONN_TIMEOUT` | `30` | Per-request timeout in seconds for engine polling |
+| `DASH_ALLOWED_HOSTS` | *(empty)* | Extra `Host` header whitelist entries (comma-separated); bound addresses are allowed automatically (wildcard binds are the exception — set `DASH_ALLOWED_HOSTS` explicitly) |
+| `DASH_CONN_TIMEOUT` | `30` | Per-connection socket read/write timeout for inbound dashboard connections (anti-slowloris); engine poll timeouts are fixed in code (2–8 s) |
 | `DASH_MAX_CONNS` | `64` | Maximum simultaneous dashboard connections |
 
 Example `dash.config`:
@@ -70,7 +71,7 @@ Typical deployment: the dashboard runs on the same machine as the engine and is 
 
 Both speed figures are differences of counters the engine itself reports; the dashboard adds no estimation of its own.
 
-- **Decode speed** = Δ(`tokens_predicted_total`) / Δ(wall clock) over a 15-second sliding window of active samples. There is no artificial cap. The engine advances the counter when requests complete, so the value holds its last window reading while a request is in flight and decays to 0 once the window slides empty (idle for more than 15 s). The card's secondary value is the maximum over the last 30 minutes.
+- **Decode speed** = total tokens produced in the window ÷ pure generation time × concurrency, over a 15-second sliding window of completed requests. There is no artificial cap. The engine advances the counter when requests complete, so the value holds its last window reading while a request is in flight and decays to 0 once the window slides empty (idle for more than 15 s). The card's secondary value is the maximum over the last 30 minutes.
 - **Prefill speed** = Δ(`prompt_tokens_total`) / Δ(`prompt_seconds_total`) for the most recent prefill burst; the reading is held until the next burst starts.
 
 ## Metric FAQ

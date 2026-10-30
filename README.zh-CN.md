@@ -1,12 +1,10 @@
 <!-- 工作名：`halogen-dashboard`。最终命名确定后，在 README.md / README.zh-CN.md / LICENSE / CONTRIBUTING.md 中全局替换。 -->
 
-# halogen-dashboard（工作名）
+# halogen-dashboard
 
 [English](README.md) | **简体中文**
 
 > 单文件、只读的本地 halogen 推理引擎监控仪表盘——GPU、内存、KV 缓存、槽位、排队与解码速度一目了然。无数据库、无构建步骤、引擎侧零探针。
-
-*（halogen：被监控的推理引擎。其公开名称/仓库确定后，此处将替换为链接。）*
 
 ## 截图
 
@@ -30,10 +28,13 @@
 
 ```bash
 python3 dash.py
+# halogen-dash listening on http://127.0.0.1:8873
 # 然后打开 http://127.0.0.1:8873
 ```
 
 仪表盘默认访问 `127.0.0.1:8899` 上的引擎（可用 `DASH_ENGINE_URL` 修改）。若 8873 端口被占用，自动向后回退至 8879，并在控制台打印实际端口。
+
+没有引擎也能看：打开 `http://127.0.0.1:8873/?demo=sleep`（或 `?demo=empty`）即可预览模型待命/空态界面。
 
 ### 配置
 
@@ -44,8 +45,8 @@ python3 dash.py
 | `DASH_ENGINE_URL` | `http://127.0.0.1:8899` | 引擎地址（仅以 `GET` 访问） |
 | `DASH_ENGINE_PROC` | `flash_serve` | 引擎进程名标记，用于内存全景中归属引擎内存 |
 | `DASH_BINDS` | `127.0.0.1` | 逗号分隔的监听地址 |
-| `DASH_ALLOWED_HOSTS` | *（空）* | `Host` 白名单补充项（逗号分隔）；已绑定地址自动放行 |
-| `DASH_CONN_TIMEOUT` | `30` | 引擎轮询的单请求超时（秒） |
+| `DASH_ALLOWED_HOSTS` | *（空）* | `Host` 白名单补充项（逗号分隔）；已绑定地址自动放行（通配绑定除外——此时需显式设置 `DASH_ALLOWED_HOSTS`） |
+| `DASH_CONN_TIMEOUT` | `30` | 仪表盘入站连接的单连接 socket 读写超时（秒，防 slowloris）；引擎轮询超时为代码内固定值（2–8 秒） |
 | `DASH_MAX_CONNS` | `64` | 仪表盘最大并发连接数 |
 
 `dash.config` 示例：
@@ -69,7 +70,7 @@ DASH_ALLOWED_HOSTS=my-host
 
 两个速度数字都是引擎自报计数器的差值，仪表盘不做任何自行估算。
 
-- **解码速度** = Δ(`tokens_predicted_total`) / Δ(墙上时间)，在 15 秒滑动窗口的活跃样本上计算，无任何人为封顶。引擎在请求完成时推进计数器，因此生成进行中显示上一窗口值，空闲超过 15 秒（窗口滑空）后归零。卡片副值为最近 30 分钟内的最高值。
+- **解码速度** = 窗口内产出 token 总量 ÷ 纯生成耗时 × 并发度（15 秒滑动窗口，按完成拍聚合），无任何人为封顶。引擎在请求完成时推进计数器，因此生成进行中显示上一窗口值，空闲超过 15 秒（窗口滑空）后归零。卡片副值为最近 30 分钟内的最高值。
 - **预填充速度** = Δ(`prompt_tokens_total`) / Δ(`prompt_seconds_total`)，对应最近一次 prefill 突发；突发结束后保持该值，直到下一次突发开始。
 
 ## 指标口径 FAQ
