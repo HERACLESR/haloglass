@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dash.log
+.DS_Store
+Thumbs.db
+dash.config
+.env
+*.log
+dash_bak*
+*.bak
+scripts/
+.vscode/
+.idea/
