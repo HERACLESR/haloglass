@@ -9,9 +9,9 @@
 
 ## Screenshots
 
-[![Dashboard, light theme, full page](screenshots/dashboard-light.png)](screenshots/dashboard-dark.png)
+[![Dashboard, light theme (left) and dark theme (right), full page](screenshots/hero-split.png)](screenshots/hero-split.png)
 
-Full-page view, light theme (1440 px wide). The image links to the [dark theme](screenshots/dashboard-dark.png) version of the same page.
+Full-page view — light theme on the left, dark theme on the right (1440 px wide). Click for full size. The screenshots are in English; Simplified Chinese is built in and switchable in the top-right corner.
 
 ## Features
 

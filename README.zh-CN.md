@@ -8,9 +8,9 @@
 
 ## 截图
 
-[![仪表盘整页截图（浅色主题）](screenshots/dashboard-light.png)](screenshots/dashboard-dark.png)
+[![仪表盘整页截图（左：浅色主题，右：深色主题）](screenshots/hero-split.png)](screenshots/hero-split.png)
 
-整页视图，浅色主题（宽 1440 px）。图片可点击，跳转到同一页面的[深色主题](screenshots/dashboard-dark.png)版本。截图为英文界面；产品内置简体中文，可在页面右上角切换。
+整页视图——左侧浅色主题、右侧深色主题（宽 1440 px），点击可查看原图。截图为英文界面；产品内置简体中文，可在页面右上角切换。
 
 ## 特性
 
