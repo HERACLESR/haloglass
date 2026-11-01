@@ -1,10 +1,10 @@
-<!-- 工作名：`halogen-dashboard`。最终命名确定后，在 README.md / README.zh-CN.md / LICENSE / CONTRIBUTING.md 中全局替换。 -->
-
-# halogen-dashboard
+# HaloGlass
 
 [English](README.md) | **简体中文**
 
 > 单文件、只读的本地 halogen 推理引擎监控仪表盘——GPU、内存、KV 缓存、槽位、排队与解码速度一目了然。无数据库、无构建步骤、引擎侧零探针。
+
+*HaloGlass 是独立的社区项目，与 halogen 项目无关联，也未获其认可或背书。*
 
 ## 截图
 

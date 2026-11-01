@@ -1,11 +1,10 @@
-<!-- Working title: `halogen-dashboard`. Once the final name is decided, perform a GLOBAL replace -->
-<!-- across README.md / README.zh-CN.md / LICENSE / CONTRIBUTING.md. -->
-
-# halogen-dashboard
+# HaloGlass
 
 **English** | [简体中文](README.zh-CN.md)
 
 > A single-file, read-only monitoring dashboard for a local halogen inference engine — GPU, memory, KV cache, slots, queueing and decode speed at a glance. No database, no build step, no agent on the engine.
+
+*HaloGlass is an independent community project, not affiliated with or endorsed by the halogen project.*
 
 ## Screenshots
 
