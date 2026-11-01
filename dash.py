@@ -164,14 +164,27 @@ def _ckpt_quant(path):
     return m.group(0) if m else stem
 
 
+def _ckpt_model_name(path):
+    """w23-B：剥分片后缀与 .gguf、再剥量化标签（连同其前分隔符）→ 模型真名
+    （Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf → Qwen3.8-Flash-Next）。
+    无量化标签=去后缀全名；剥后为空（标签在串首）→ None（前端回退 alias）。"""
+    name = os.path.basename(path)
+    stem = _CKPT_EXT_RE.sub("", _CKPT_SHARD_RE.sub("", name))
+    m = _CKPT_QUANT_RE.search(stem)
+    if m:
+        stem = stem[:m.start()]
+    stem = stem.strip("-_ ")
+    return stem or None
+
+
 def model_ckpt_info():
-    """返回 {"path": 完整路径, "quant": 量化标签}；
+    """返回 {"path": 完整路径, "quant": 量化标签, "name": 模型真名（w23-B 派生）}；
     DASH_MODEL_LABEL 覆盖一切（置空值=强制隐藏徽章）；非 Linux / 无权限 / 无引擎进程 → None。"""
     try:
         env = os.environ.get("DASH_MODEL_LABEL")
         if env is not None:
             env = env.strip()
-            return {"path": env, "quant": env} if env else None
+            return {"path": env, "quant": env, "name": env} if env else None
         if not os.path.isdir("/proc"):
             return None
         me = str(os.getpid())
@@ -187,7 +200,7 @@ def model_ckpt_info():
                 continue
             p = _ckpt_path_from_cmdline(cmd)
             if p:
-                return {"path": p, "quant": _ckpt_quant(p)}
+                return {"path": p, "quant": _ckpt_quant(p), "name": _ckpt_model_name(p)}
     except Exception:
         return None
     return None
@@ -343,6 +356,8 @@ def collect_once():
         if _ckpt_info:
             snap["model_ckpt_path"] = _ckpt_info["path"]
             snap["model_ckpt_quant"] = _ckpt_info["quant"]
+            if _ckpt_info.get("name"):  # w23-B：派生真名（剥不出=无键 → 前端回退 alias）
+                snap["model_ckpt_name"] = _ckpt_info["name"]
     except Exception:
         pass
     try:
@@ -923,6 +938,7 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
 .kv-l2 b.skel{width:22px}
 #donut-total.skel{width:40px}
 .stat .v.skel{width:56px;margin:0 auto}  /* w16-①：小卡骨架=56×26 盒水平居中（与有值态居中文本同位） */
+.pval.skel{align-self:center}  /* w23-A 占位符对齐轴统一（集中规则）：.pval 自身即骨架时是 .pitem（列 flex）的 flex item，交叉轴默认 flex-start → 骨架条贴左，而数值态 text-align:center → 居中（用户实锤「池压力有的居中有的居左」）。align-self:center 使骨架中心=数值中心。其余槽位不受影响：inline-block 子骨架本就随所在槽 text-align 走；行 flex 的 item 其 align-self 管垂直向（kv-row/qrow/pf-v 右缘锚定不变）；.sk-kpi 已自带 align-self:center。全量病灶清单见 w23\自审表.md */
 .skel::after{content:'';position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,var(--accent-soft),transparent);animation:shimmer 1.8s infinite}
 @keyframes shimmer{100%{transform:translateX(100%)}}
 .breath{width:9px;height:9px;border-radius:50%;background:var(--accent);animation:breathe 2.2s ease-in-out infinite;flex:none}
@@ -1483,8 +1499,14 @@ function render(s){
   /* 侧栏模型信息（w9-I：hv 保持最后有效值） */
   var mName=$('m-name');
   var mAlias=s.model_alias||s.model;
-  hv('m-name',!!mAlias,mAlias||'',mName);
-  mName.setAttribute('title',mAlias||'');  /* w10-ⓙP2-1：单行截断后悬浮全名 */
+  /* w23-B：主行=模型真名。回退链：DASH_MODEL_LABEL（后端已覆盖进 name）→ checkpoint 派生名 → 原样 alias
+     （非 Linux/无引擎=无 model_ckpt_name 键 → 页面与 w22 一致）；demo=固定演示值；⛔ 硬编码真实模型名进代码 */
+  var mDisp=s.model_ckpt_name||(DEMO?'demo-model':null)||mAlias;
+  hv('m-name',!!mDisp,mDisp||'',mName);
+  /* w23-B：tooltip 说明来源（checkpoint 派生=附引擎 alias；回退态=引擎别名）；⛔ 原生 title（自绘 tooltip 体系） */
+  if(s.model_ckpt_name||DEMO){mName.setAttribute('data-tip',t('nameTipCkpt',{a:mAlias||'—'}));mName.removeAttribute('title');}
+  else if(mAlias){mName.setAttribute('data-tip',t('nameTipAlias'));mName.removeAttribute('title');}
+  else{mName.removeAttribute('data-tip');mName.removeAttribute('title');}
   hv('m-ctx',isNum(s.model_context),num(s.model_context),$('m-ctx'),'sm');
   hv('m-kv',!!s.kv_cache_type,s.kv_cache_type?s.kv_cache_type.toUpperCase():'',$('m-kv'),'sm');
   hv('m-fmt',!!s.checkpoint_format,s.checkpoint_format?s.checkpoint_format.toUpperCase():'',$('m-fmt'),'sm');
@@ -1674,7 +1696,9 @@ var I18N={
 'zh-CN':{
  title:'halogen 监控',brandSide:'halogen 监控',modelInfo:'模型信息',ctxLen:'上下文长度',
   kvPrec:'KV 缓存精度',weightFmt:'权重格式',engineVer:'引擎版本',slotCount:'槽位数',
-  quantTip:'权重文件 {p}',  /* w22-B：量化徽章 tooltip（完整 checkpoint 路径） */
+   quantTip:'权重文件 {p}',  /* w22-B：量化徽章 tooltip（完整 checkpoint 路径） */
+   nameTipCkpt:'模型名派生自引擎 checkpoint 文件名（引擎别名：{a}）',  /* w23-B：主行来源 tooltip */
+   nameTipAlias:'模型名来自引擎别名（未读到 checkpoint 文件名）',  /* w23-B */
   slotState:'槽位状态',slotStateAria:'槽位状态说明',slotStateTip:'引擎仅在推理完成时上报速度，不提供单槽位数据。展示从 1 起，后端编号从 0 起。',
    reqStatus:'请求状态',
     inFlight:'处理中',queuedReq:'排队请求',queueWaits:'排队等待',timesUnit:'次',abandoned:'已放弃',
@@ -1748,7 +1772,9 @@ var I18N={
 'en':{
  title:'halogen Monitoring',brandSide:'halogen Monitoring',modelInfo:'Model Info',ctxLen:'Context Length',
   kvPrec:'KV Cache Precision',weightFmt:'Weight Format',engineVer:'Engine Version',slotCount:'Slot Count',
-  quantTip:'Weights file {p}',  /* w22-B */
+   quantTip:'Weights file {p}',  /* w22-B */
+   nameTipCkpt:'Model name derived from the engine checkpoint file name (engine alias: {a})',  /* w23-B */
+   nameTipAlias:'Model name is the engine alias (checkpoint file name not available)',  /* w23-B */
   slotState:'Slot State',slotStateAria:'Slot State Explanation',slotStateTip:'Speed Is Reported Only When Inference Completes; Per-Slot Data Not Provided. Display Starts at 1; Backend Numbering Starts at 0.',
    reqStatus:'Request Status',
     inFlight:'Active',queuedReq:'Queued Requests',queueWaits:'Queue Waits',timesUnit:'',abandoned:'Abandoned',
@@ -1822,7 +1848,9 @@ var I18N={
 'ko':{
  title:'halogen 모니터링',brandSide:'halogen 모니터링',modelInfo:'모델 정보',ctxLen:'컨텍스트 길이',
   kvPrec:'KV 캐시 정밀도',weightFmt:'가중치 형식',engineVer:'엔진 버전',slotCount:'슬롯 수',
-  quantTip:'가중치 파일 {p}',  /* w22-B */
+   quantTip:'가중치 파일 {p}',  /* w22-B */
+   nameTipCkpt:'모델 이름은 엔진 체크포인트 파일명에서 파생되었습니다 (엔진 별칭: {a})',  /* w23-B */
+   nameTipAlias:'모델 이름은 엔진 별칭입니다 (체크포인트 파일명 없음)',  /* w23-B */
   slotState:'슬롯 상태',slotStateAria:'슬롯 상태 설명',slotStateTip:'속도는 추론 완료 시에만 보고되며, 슬롯별 데이터는 제공되지 않습니다. 표시는 1부터 시작하며, 백엔드 번호는 0부터 시작합니다.',
    reqStatus:'요청 상태',
     inFlight:'진행 중',queuedReq:'대기열 요청',queueWaits:'대기열 대기',timesUnit:'회',abandoned:'포기',
@@ -1896,7 +1924,9 @@ var I18N={
 'de':{
  title:'halogen-Überwachung',brandSide:'halogen-Überwachung',modelInfo:'Modellinfo',ctxLen:'Kontextlänge',
   kvPrec:'KV-Cache-Präzision',weightFmt:'Gewichtsformat',engineVer:'Engine-Version',slotCount:'Slotanzahl',
-  quantTip:'Gewichtsdatei {p}',  /* w22-B */
+   quantTip:'Gewichtsdatei {p}',  /* w22-B */
+   nameTipCkpt:'Modellname aus dem Checkpoint-Dateinamen abgeleitet (Engine-Alias: {a})',  /* w23-B */
+   nameTipAlias:'Modellname ist der Engine-Alias (kein Checkpoint-Dateiname verfügbar)',  /* w23-B */
   slotState:'Slotstatus',slotStateAria:'Erklärung zum Slotstatus',slotStateTip:'Die Geschwindigkeit wird nur bei Abschluss der Inferenz berichtet; pro Slot werden keine Daten bereitgestellt. Die Anzeige beginnt bei 1; die Backend-Nummerierung beginnt bei 0.',
    reqStatus:'Anfragestatus',
     inFlight:'Aktiv',queuedReq:'Anstehende Anfragen',queueWaits:'Wartefälle',timesUnit:'',abandoned:'Aufgegeben',
