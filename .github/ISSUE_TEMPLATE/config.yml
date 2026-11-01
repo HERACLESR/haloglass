@@ -2,4 +2,4 @@ blank_issues_enabled: true
 contact_links:
   - name: Question / idea
     url: https://github.com/HERACLESR/halogen-dashboard/discussions
-    about: Ask anything or suggest a feature (enable Discussions in repo settings to use this)
+    about: Ask anything or suggest a feature

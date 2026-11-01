@@ -21,7 +21,7 @@ labels: bug
 3. See ...
 
 **Browser console errors**
-<!-- Press F12 → Console, paste anything red. The dashboard itself logs nothing sensitive. -->
+<!-- Press F12 → Console, paste anything red. -->
 
 **Screenshots**
 <!-- If applicable. Note: the dashboard shows your model name and metrics — scrub anything you do not want public. -->

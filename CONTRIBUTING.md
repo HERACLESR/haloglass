@@ -6,7 +6,7 @@ Thanks for helping! This project is a **single-file** read-only monitoring dashb
 
 - One bug / one feature per issue.
 - For bugs, include: browser + version, dashboard language & theme, what you expected vs. what you saw, and (if display-related) a screenshot.
-- For metric-semantics questions, check the FAQ in [README](README.md#metric-faq) first — several "bugs" are actually intentional metric definitions (e.g. Reserved is not a subset of Used).
+- For metric-semantics questions, check the FAQ in [README](README.md#metric-faq) first — some metric behaviors are intentional definitions (e.g. Reserved is not a subset of Used).
 
 ## Pull Requests
 
@@ -25,7 +25,7 @@ git commit -s
 ## Code style
 
 - **Stay single-file.** Everything ships in `dash.py`; no new modules, no third-party dependencies (Python 3 stdlib only).
-- The file is organized by **comment banners into zones** — presentation layer (HTML/CSS/JS), collection layer (engine polling), and the **S2 security zone** (binds, Host whitelist, response headers). Keep changes inside the zone they belong to and don't move code across zones casually. Zone banner comments in the source are in Chinese; the zone map above is the English reference.
+- The file is organized by **comment banners into zones** — presentation layer (HTML/CSS/JS), collection layer (engine polling), and the **S2 security zone** (binds, Host whitelist, response headers). Keep changes inside the zone they belong to and don't move code across zones casually. Zone banner comments in the source are in Chinese.
 - Follow the existing naming and formatting of the zone you touch; comments explaining *why* are welcome, comments restating *what* are not.
 
 ## License
