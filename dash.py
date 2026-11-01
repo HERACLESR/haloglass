@@ -5,6 +5,7 @@ import gzip
 import json
 import math
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -125,6 +126,71 @@ def proc_rss_kib():
             eng += rss
             found = True
     return (tot, eng) if found else (None, None)
+
+
+# w22-B: 引擎 checkpoint 真名（量化徽章）。best-effort 只读采集：扫 /proc/[0-9]*/cmdline 找 --ck/--checkpoint，
+# 剥分片后缀、提量化标签；任何失败静默回退 None（⛔ 采集失败不得影响页面）。DASH_MODEL_LABEL 环境变量优先覆盖一切。
+CKPT_REFRESH_S = 30.0
+_CKPT_SHARD_RE = re.compile(r"-0*\d+-of-0*\d+\.gguf$", re.IGNORECASE)
+_CKPT_EXT_RE = re.compile(r"\.gguf$", re.IGNORECASE)
+# 量化标签 = 模型名主干之后的部分（如 UD-IQ4_XS / Q4_K_M / FP8_E4M3 / BF16）。
+# 左边界=串首或分隔符（⛔ 误吞 "ef28" 里的 f28）；UD- 前缀（unsloth dynamic）随标签整体捕获；Qwen3.8 的 "Qw" 不匹配 Q\d。
+_CKPT_QUANT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:UD-)?(?:IQ\d|Q\d|NF\d|FP\d|BF\d|F\d)[A-Za-z0-9_]*", re.IGNORECASE)
+_ckpt_info = None
+_ckpt_ts = 0.0
+
+
+def _ckpt_path_from_cmdline(cmd):
+    """从 cmdline(bytes) 提取 checkpoint 路径：--ck <path> / --checkpoint <path> / --ck=<path> / --checkpoint=<path>。
+    仅认独立参数 token（⛔ 误吞 bash -c 整串里的 "--ck"）。"""
+    args = [a.decode("utf-8", "replace") for a in cmd.split(b"\0") if a]
+    for i, a in enumerate(args):
+        if a in ("--ck", "--checkpoint") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--ck="):
+            return a[5:]
+        if a.startswith("--checkpoint="):
+            return a[13:]
+    return None
+
+
+def _ckpt_quant(path):
+    """剥 -00001-of-00003.gguf 分片后缀 → 提取模型名主干之后的量化标签（如 UD-IQ4_XS）；
+    提不出则返回去分片后缀全名。"""
+    name = os.path.basename(path)
+    stem = _CKPT_SHARD_RE.sub("", name)
+    m = _CKPT_QUANT_RE.search(_CKPT_EXT_RE.sub("", stem))
+    return m.group(0) if m else stem
+
+
+def model_ckpt_info():
+    """返回 {"path": 完整路径, "quant": 量化标签}；
+    DASH_MODEL_LABEL 覆盖一切（置空值=强制隐藏徽章）；非 Linux / 无权限 / 无引擎进程 → None。"""
+    try:
+        env = os.environ.get("DASH_MODEL_LABEL")
+        if env is not None:
+            env = env.strip()
+            return {"path": env, "quant": env} if env else None
+        if not os.path.isdir("/proc"):
+            return None
+        me = str(os.getpid())
+        for d in os.listdir("/proc"):
+            if not d.isdigit() or d == me:
+                continue
+            try:
+                with open("/proc/%s/cmdline" % d, "rb") as f:
+                    cmd = f.read(4096)
+            except OSError:
+                continue
+            if b"--ck" not in cmd and b"--checkpoint" not in cmd:
+                continue
+            p = _ckpt_path_from_cmdline(cmd)
+            if p:
+                return {"path": p, "quant": _ckpt_quant(p)}
+    except Exception:
+        return None
+    return None
 
 
 def http_get(url, timeout=8):
@@ -262,10 +328,23 @@ def collect_once():
     global _prev_tok, _prev_sec, _prev_ts, _prev_ifl, _decode_tps
     global _prev_ptok, _prev_psec, _prefill_tps
     global _cache_miss, _cache_ok_ts
+    global _ckpt_info, _ckpt_ts
     _cycle += 1
     snap = {"ts": round(time.time(), 1)}
     with _lock:
         snap.update(_slow)  # health/props 字段 = 慢线程最新快照（≤1s 旧）
+    # w22-B：checkpoint 量化徽章（30s 缓存重扫；失败保持旧值，从未成功=不出键=前端徽章整行不渲染）
+    try:
+        if _ckpt_info is None or snap["ts"] - _ckpt_ts >= CKPT_REFRESH_S:
+            got = model_ckpt_info()
+            if got is not None or _ckpt_info is None:
+                _ckpt_info = got
+            _ckpt_ts = snap["ts"]
+        if _ckpt_info:
+            snap["model_ckpt_path"] = _ckpt_info["path"]
+            snap["model_ckpt_quant"] = _ckpt_info["quant"]
+    except Exception:
+        pass
     try:
         m = parse_metrics(fetch_retry(lambda t: http_get(HAL + "/metrics", timeout=t or 2)))
         snap["kv_pool_reserved_tokens"] = m.get("halogen:kv_pool_reserved_tokens")
@@ -594,6 +673,7 @@ HTML = """<!DOCTYPE html>
   --danger-glow:rgba(185,28,28,.4);
   --tip-bg:rgba(15,23,42,.96);--tip-fg:#f8fafc;
   --mono:ui-monospace,"Cascadia Mono",Consolas,"JetBrains Mono",monospace;
+  --num:ui-monospace,"Cascadia Mono",Consolas,"JetBrains Mono",monospace;  /* w22-A：数值槽专用等宽数字字体栈（Space Grotesk 无 tnum → tabular-nums 空操作） */
   --display:'Space Grotesk',system-ui,-apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
 }
 :root[data-theme=dark]{
@@ -622,7 +702,12 @@ html,body{margin:0}
 body{background:var(--bg);color:var(--fg);font-size:14px;line-height:1.5;
   font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
   -webkit-font-smoothing:antialiased}
-h1,h2,.brand,.k-val,.g-num,.stat .v,.pval{font-family:var(--display)}
+h1,h2,.brand{font-family:var(--display)}
+/* w22-A 数值对齐统一方案（根因：Space Grotesk 无 tnum 特性 → 原 font-variant-numeric:tabular-nums 为空操作，
+   比例数字致 .qrow「1 vs 0」错位与各数值位每拍刷新跳变）：
+   所有【数值显示位】（含其内联单位）一律换 --num 等宽数字栈；标签文字保持正文字体（CJK 走系统回退、外观不变）。
+   同一视觉层级同一方案，完整病灶清单与「无需改」结论见 w22\自审表.md */
+.k-val,.g-num,.stat .v,.pval,.dn-num,.kv-used b,.legend b,.time-chip .tv{font-family:var(--num)}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 button{font:inherit}
 .app{display:grid;grid-template-columns:256px minmax(0,1fr);min-height:100vh;max-width:1680px;margin:0 auto}
@@ -633,11 +718,14 @@ button{font:inherit}
 .side-sec{padding:24px;border-bottom:1px solid var(--border);min-width:0}
 .side-title{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px;display:flex;align-items:center;gap:8px;min-width:0;overflow-wrap:anywhere}
 .model-name{font-size:14px;font-weight:600;font-family:var(--mono);white-space:normal;overflow-wrap:anywhere;word-break:break-word;margin-bottom:8px}  /* w19-A1：模型名完整折行显示（⛔ 省略号截断）；全名仍走 title 悬浮提示 */
+/* w22-B：模型名下方量化徽章小字行（tooltip=完整 checkpoint 路径；无数据整行 display:none，页面与 w21 一致） */
+.model-quant{margin:-4px 0 8px;display:flex;min-width:0}
+.mq{display:inline-flex;align-items:center;font-family:var(--mono);font-size:11px;font-weight:600;line-height:1.5;color:var(--muted);background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:0 8px;max-width:100%;overflow-wrap:anywhere;cursor:help}
 .kv-row{display:flex;justify-content:space-between;align-items:baseline;gap:8px;font-size:13px;color:var(--muted);padding:4px 0}
-.kv-row b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;font-family:var(--display);text-align:right;overflow-wrap:anywhere}
+.kv-row b{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;font-family:var(--num);text-align:right;overflow-wrap:anywhere}  /* w22-A：数值槽 → --num（模型信息 上下文长度/槽位数 等宽；GGUF/F16/vX.Y.Z 走 mono=技术口径，与 .model-name 同族） */
 .slot-li{display:flex;align-items:center;gap:8px;padding:4px 8px;margin:0 -8px;border-radius:12px;font-size:13px;font-variant-numeric:tabular-nums}
 .slot-li:hover{background:var(--hover)}
-.slot-li .spd{margin-left:auto;font-weight:600;font-family:var(--display)}
+.slot-li .spd{margin-left:auto;font-weight:600;font-family:var(--num)}  /* w22-A：槽位速度数值 → --num */
 .slot-li .idle-t{margin-left:auto;color:var(--muted);font-weight:400}
 .slot-li .slot-n{font-family:var(--mono);font-weight:400;font-size:12px;color:var(--muted)}  /* w13-ⓒ→w17-②→w20-②：槽位编号数字=--mono 等宽栈；w20 实测 computed：字体栈本就同 .hrow code，差异在 size 13vs12/weight 600vs400/color 黑vs灰（w18 教训重演：真因非字体栈）→ 三项全对齐 .hrow code（12px/400/--muted），与「health」逐像素同款；行本身中文保持正文族（w10-ⓒ） */
 .slot-li .slot-nm{font-family:inherit;color:var(--muted)}  /* w18-①：「槽位」中文前缀=显式正文族（computed font-family 与其他模块中文逐字符一致，断言见 shots/post_assert_fonts.txt）+ 与其他模块中文标签同灰（w17 线上排查实锤：字体栈与实际用字本就一致，"看着像异体字"真因=黑色 --fg vs 其他模块中文 --muted 灰） */
@@ -668,7 +756,7 @@ button{font:inherit}
 .qblock.alert{background:var(--danger-bg);animation:qbreath 2s ease-in-out infinite}
 .qblock.alert #q-queued{font-size:16px;font-weight:700;color:var(--danger-text)}
 .qrow{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:4px 0;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
-.qrow b{color:var(--fg);font-weight:600;font-family:var(--display);text-align:right}
+.qrow b{color:var(--fg);font-weight:600;font-family:var(--num);text-align:right}  /* w22-A：已知病灶「1 vs 0」错位 = Space Grotesk 比例数字，→ --num 后同宽对齐 */
 .qnw{position:relative;text-align:right}
 .qu{position:absolute;left:calc(100% + 1px);top:0;color:var(--muted);font-weight:400}
 .qrow>span{overflow-wrap:break-word;hyphens:auto;min-width:0}
@@ -724,14 +812,14 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em;min-width:0;whi
 .k-lbl{font-size:16px;font-weight:600;display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;overflow-wrap:anywhere}  /* w19-A4：KPI 标题长词折行（Dekodiergeschwindigkeit） */
 .k-lbl>span{display:inline-flex;align-items:center;gap:8px;min-width:0;overflow-wrap:anywhere}
 .k-lbl svg{width:18px;height:18px;flex:none;stroke:var(--accent);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.k-val{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1.2;font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.k-val{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1.2;font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-height:1.2em}  /* w22-A：min-height=数值行盒高——骨架条(0.72em)→数值(1.2em) 首帧零位移（修前主内容整体下移 9.41px，shots/w22_align_before.json）；数值态与 w21 恒等 */
 .k-num{display:inline-flex;align-items:baseline;gap:8px;white-space:nowrap}
 .k-val .unit{font-size:14px;font-weight:500;color:var(--muted)}
 /* w10-ⓕ 解码速度副值行；w11-ⓝ 只剩峰值：flex 布局数字/单位 flex:none 永不截断（标签可收缩），
    并用行距回收抵消行高（gap 8→3、副行/主值 line-height→1），卡高回归 w9 原高 */
 .k-sub{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:4px;line-height:1}
-.k-sub b{color:var(--fg);font-weight:600;flex:none;font-family:var(--display)}  /* w19-B5：30m 峰值数字字体与其他主数值统一 */
-.k-sub .ks-u{flex:none}
+.k-sub b{color:var(--fg);font-weight:600;flex:none;font-family:var(--num)}  /* w19-B5：30m 峰值数字字体与其他主数值统一；w22-A：→ --num */
+.k-sub .ks-u{flex:none;font-family:var(--num)}  /* w22-A：单位与数值同栈（同一数值层级） */
 .k-sub .ks-l{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #kc-spd{gap:3px}
 #kc-spd .k-val{line-height:1}
@@ -816,11 +904,11 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em;min-width:0;whi
 .sparkgrp{flex:1 1 0;min-height:48px;display:flex;flex-direction:column;padding-top:12px}
 .sparkbox{position:relative;min-width:0;min-height:0;flex:1 1 auto}
 svg.spark{width:100%;height:100%;min-height:0;display:block}
-.stime{position:absolute;bottom:0;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none;font-family:var(--display)}
+.stime{position:absolute;bottom:0;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none;font-family:var(--num)}  /* w22-A：HH:MM:SS 每拍走字 → --num 零抖动 */
 .stime.l{left:2px}
 .stime.r{right:2px}
 .sp-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:8px;font-size:12px;color:var(--muted)}
-.sparktip{position:absolute;top:0;transform:translate(-50%,-115%);display:none;background:var(--fg);color:var(--surface);border-radius:8px;padding:8px;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;pointer-events:none;z-index:5;font-family:var(--display)}
+.sparktip{position:absolute;top:0;transform:translate(-50%,-115%);display:none;background:var(--fg);color:var(--surface);border-radius:8px;padding:8px;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;pointer-events:none;z-index:5;font-family:var(--num)}  /* w22-A：走势悬浮值=纯数值，与 .stime 同层级 → --num */
 /* 空态骨架 */
 /* w16-①：骨架条与所在位真实文本同字号同行高——高度=0.72em（≈cap-height 墨迹带），
    vertical-align:baseline 使灰条底边落在文字基线上（与真实文本同基线）；
@@ -875,6 +963,7 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
   <div class="side-sec">
     <div class="side-title" data-i18n="modelInfo">模型信息</div>
     <div class="model-name skel" id="m-name"></div>
+    <div class="model-quant" id="m-quant-row" style="display:none"><span class="mq" id="m-quant"></span></div>  <!-- w22-B：量化徽章（model_ckpt_quant；demo=固定演示值；无数据不渲染） -->
     <div class="kv-row"><span data-i18n="ctxLen">上下文长度</span><b id="m-ctx" class="skel sm"></b></div>
     <div class="kv-row"><span data-i18n="kvPrec">KV 缓存精度</span><b id="m-kv" class="skel sm"></b></div>
     <div class="kv-row"><span data-i18n="weightFmt">权重格式</span><b id="m-fmt" class="skel sm"></b></div>
@@ -1059,6 +1148,13 @@ function show(el,on){el.style.display=on?'':'none';}
 function vis(el,on){el.style.visibility=on?'':'hidden';}  /* w19-A3：徽章用 visibility 切换，固定占位 → 卡片零抖动 */
 function txt(el,v){el.classList.remove('skel','lg','sm','sk-kpi','gsk');el.textContent=v;}
 function sk(el,w){el.textContent='';el.classList.remove('lg','sm','sk-kpi','gsk');el.classList.add('skel');if(w)el.classList.add(w);}
+/* w22-A：顶栏「最后更新」时间部分包 .tv span（--num 等宽数字，每拍零宽度抖动）；标签文字保持正文字体。
+   模板按 {t} 哨兵切分，四语言通用（同 slotLabel 模式）。 */
+function setSub(tm){var el=$('sub');var p=t('lastUpdated',{t:'\u0001'}).split('\u0001');
+  el.textContent='';var a=document.createElement('span');a.textContent=p[0];
+  var b=document.createElement('span');b.className='tv';b.textContent=tm;
+  var c=document.createElement('span');c.textContent=p[1]||'';
+  el.appendChild(a);el.appendChild(b);el.appendChild(c);}
 /* w9-I：采集异常（键缺失/err 键/NaN）时数值保持——每个显示位记住最后有效值，原位保留不空白；恢复后新值顶掉旧值 */
 var lastGood={};
 function hv(k,ok,disp,el,w){
@@ -1282,6 +1378,9 @@ function slotLabel(nm,idx){
   ns.textContent=idx;}
 /* w18-②：首帧占位行（数量=引擎 slots 数，未知时先占 3 行）——与真实行同结构同高（.slot-li 27.5px），
    首帧到出数据侧栏下方模块零跳动（修前实锤：出数据后下方模块位移 90.5px，shots/pre_layout_verdict.json） */
+/* w22-A：记住上次真实槽位数（localStorage）→ 首帧占位行数=上次行数，回访者「占位→数值」零位移；
+   首访无记录仍 3 行（w18-② 原行为）。引擎改配置→行数不符仅一次性位移并自动纠正。 */
+function slotsPref(){var n=3;try{var v=parseInt(localStorage.getItem('dash-slots'),10);if(v>=1&&v<=1024)n=v;}catch(e){}return n;}
 function slotSkel(side,k){
   while(side.children.length>k)side.removeChild(side.lastChild);
   while(side.children.length<k)side.appendChild(mkSideRow());
@@ -1297,6 +1396,7 @@ function updSlots(s){
   var engDown=!isNum(s.ts)||!s.halogen_ok;
   var count=sd.length?sd.length:(isNum(s.ts)?n:0);
   count=Math.min(count,1024);  /* w15-bugP1-4：钳制，⛔ 引擎畸形 total_slots 打挂页签 */
+  if(count>0){try{if(localStorage.getItem('dash-slots')!==String(count))localStorage.setItem('dash-slots',String(count));}catch(e){}}  /* w22-A */
   var side=$('side-slots');
   if(count===0&&!isNum(s.ts)){slotSkel(side,3);return;}  /* w18-②：首帧（无 ts）→ 3 占位行，⛔ 出数据后行才出现把侧栏下方顶下去 */
   if(count===0&&isNum(s.ts)){
@@ -1379,7 +1479,7 @@ function render(s){
   else if(sleeping){dot.className='dot sleep';stxt.textContent=t('modelSleeping');pill.setAttribute('data-tip',t('guideSleep'));}
   else if(s.halogen_ok){dot.className='dot on';stxt.textContent=t('engineRunning');pill.removeAttribute('data-tip');}
   else{dot.className='dot off';stxt.textContent=t('engineNotResp');pill.setAttribute('data-tip',t('guideOff'));}
-  $('sub').textContent=t('lastUpdated',{t:(first?'—':new Date(s.ts*1000).toLocaleTimeString('zh-CN',{hour12:false}))});
+  setSub(first?'—':new Date(s.ts*1000).toLocaleTimeString('zh-CN',{hour12:false}));  /* w22-A：时间走 .tv 等宽数字 */
   /* 侧栏模型信息（w9-I：hv 保持最后有效值） */
   var mName=$('m-name');
   var mAlias=s.model_alias||s.model;
@@ -1391,6 +1491,14 @@ function render(s){
   hv('m-ver',!!s.engine_version,s.engine_version?'v'+s.engine_version:'',$('m-ver'),'sm');
   var nSlots=isNum(s.total_slots)?s.total_slots:(isNum(s.slots)?s.slots:null);
   hv('m-slots',nSlots!=null,num(nSlots)||'',$('m-slots'),'sm');
+  /* w22-B：量化徽章（后端 model_ckpt_quant/path；DASH_MODEL_LABEL 后端已覆盖一切；
+     demo 模式固定演示值；无键=非 Linux/无权限/无进程 → 整行不渲染，页面与 w21 一致） */
+  var ckq=s.model_ckpt_quant||(DEMO?'Q4_K_M':null);
+  var ckp=s.model_ckpt_path||(DEMO?'/models/demo/demo-model-Q4_K_M.gguf':null);
+  var mqRow=$('m-quant-row');
+  if(ckq){$('m-quant').textContent=ckq;mqRow.style.display='';
+    $('m-quant').setAttribute('data-tip',t('quantTip',{p:ckp||''}));}
+  else{mqRow.style.display='none';$('m-quant').removeAttribute('data-tip');}
   /* 采集健康（侧栏）：err_* 键即通道健康状态（后端已"判异常前先重试一次"）
      w19-B4：cache 宽限期（1-2 拍失败）不报异常 → 中性「重试中」+ 值置灰 + tooltip 数据年龄 */
   var cStale=!!s.cache_stale;
@@ -1565,7 +1673,8 @@ var lang='zh-CN';try{var _sl=localStorage.getItem('dash-lang');if(LANGS.indexOf(
 var I18N={
 'zh-CN':{
  title:'halogen 监控',brandSide:'halogen 监控',modelInfo:'模型信息',ctxLen:'上下文长度',
- kvPrec:'KV 缓存精度',weightFmt:'权重格式',engineVer:'引擎版本',slotCount:'槽位数',
+  kvPrec:'KV 缓存精度',weightFmt:'权重格式',engineVer:'引擎版本',slotCount:'槽位数',
+  quantTip:'权重文件 {p}',  /* w22-B：量化徽章 tooltip（完整 checkpoint 路径） */
   slotState:'槽位状态',slotStateAria:'槽位状态说明',slotStateTip:'引擎仅在推理完成时上报速度，不提供单槽位数据。展示从 1 起，后端编号从 0 起。',
    reqStatus:'请求状态',
     inFlight:'处理中',queuedReq:'排队请求',queueWaits:'排队等待',timesUnit:'次',abandoned:'已放弃',
@@ -1638,7 +1747,8 @@ var I18N={
 },
 'en':{
  title:'halogen Monitoring',brandSide:'halogen Monitoring',modelInfo:'Model Info',ctxLen:'Context Length',
- kvPrec:'KV Cache Precision',weightFmt:'Weight Format',engineVer:'Engine Version',slotCount:'Slot Count',
+  kvPrec:'KV Cache Precision',weightFmt:'Weight Format',engineVer:'Engine Version',slotCount:'Slot Count',
+  quantTip:'Weights file {p}',  /* w22-B */
   slotState:'Slot State',slotStateAria:'Slot State Explanation',slotStateTip:'Speed Is Reported Only When Inference Completes; Per-Slot Data Not Provided. Display Starts at 1; Backend Numbering Starts at 0.',
    reqStatus:'Request Status',
     inFlight:'Active',queuedReq:'Queued Requests',queueWaits:'Queue Waits',timesUnit:'',abandoned:'Abandoned',
@@ -1711,7 +1821,8 @@ var I18N={
 },
 'ko':{
  title:'halogen 모니터링',brandSide:'halogen 모니터링',modelInfo:'모델 정보',ctxLen:'컨텍스트 길이',
- kvPrec:'KV 캐시 정밀도',weightFmt:'가중치 형식',engineVer:'엔진 버전',slotCount:'슬롯 수',
+  kvPrec:'KV 캐시 정밀도',weightFmt:'가중치 형식',engineVer:'엔진 버전',slotCount:'슬롯 수',
+  quantTip:'가중치 파일 {p}',  /* w22-B */
   slotState:'슬롯 상태',slotStateAria:'슬롯 상태 설명',slotStateTip:'속도는 추론 완료 시에만 보고되며, 슬롯별 데이터는 제공되지 않습니다. 표시는 1부터 시작하며, 백엔드 번호는 0부터 시작합니다.',
    reqStatus:'요청 상태',
     inFlight:'진행 중',queuedReq:'대기열 요청',queueWaits:'대기열 대기',timesUnit:'회',abandoned:'포기',
@@ -1784,7 +1895,8 @@ var I18N={
 },
 'de':{
  title:'halogen-Überwachung',brandSide:'halogen-Überwachung',modelInfo:'Modellinfo',ctxLen:'Kontextlänge',
- kvPrec:'KV-Cache-Präzision',weightFmt:'Gewichtsformat',engineVer:'Engine-Version',slotCount:'Slotanzahl',
+  kvPrec:'KV-Cache-Präzision',weightFmt:'Gewichtsformat',engineVer:'Engine-Version',slotCount:'Slotanzahl',
+  quantTip:'Gewichtsdatei {p}',  /* w22-B */
   slotState:'Slotstatus',slotStateAria:'Erklärung zum Slotstatus',slotStateTip:'Die Geschwindigkeit wird nur bei Abschluss der Inferenz berichtet; pro Slot werden keine Daten bereitgestellt. Die Anzeige beginnt bei 1; die Backend-Nummerierung beginnt bei 0.',
    reqStatus:'Anfragestatus',
     inFlight:'Aktiv',queuedReq:'Anstehende Anfragen',queueWaits:'Wartefälle',timesUnit:'',abandoned:'Aufgegeben',
@@ -1914,7 +2026,7 @@ applyTheme(_st);
 applyLang();
 gaugeInkCenter();
 if(DEMO){render({});}
-else{slotSkel($('side-slots'),3);seed();connect();}  /* w18-②：启动即渲染 3 首帧占位行（demo 态不占，⛔ 破坏 demo=empty/sleep） */
+else{slotSkel($('side-slots'),slotsPref());seed();connect();}  /* w18-②：启动即渲染首帧占位行（demo 态不占，⛔ 破坏 demo=empty/sleep）；w22-A：行数=上次记忆（slotsPref） */
 </script>
 </body>
 </html>
