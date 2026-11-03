@@ -28,7 +28,7 @@ Full-page view — light theme on the left, dark theme on the right (1440 px wid
 
 ```bash
 python3 dash.py
-# halogen-dash listening on http://127.0.0.1:8873
+# HaloGlass listening on http://127.0.0.1:8873
 # then open http://127.0.0.1:8873
 ```
 
@@ -82,7 +82,7 @@ No. *Reserved* is the space *declared* by in-flight requests (prompt + max_token
 
 ## Credits
 
-- Bundled font: [Space Grotesk](https://github.com/floriankarsten/space-grotesk) © Florian Karsten, licensed under the **SIL Open Font License 1.1** (the font is embedded in `dash.py` as base64 `@font-face`). Full license text: [`docs/OFL-SpaceGrotesk.txt`](docs/OFL-SpaceGrotesk.txt).
+- Bundled fonts: [Space Grotesk](https://github.com/floriankarsten/space-grotesk) © Florian Karsten and [Unbounded](https://github.com/googlefonts/unbounded) © The Unbounded Project Authors (wordmark), both licensed under the **SIL Open Font License 1.1** (embedded in `dash.py` as base64 `@font-face`). Full license texts: [`docs/OFL-SpaceGrotesk.txt`](docs/OFL-SpaceGrotesk.txt), [`docs/OFL-Unbounded.txt`](docs/OFL-Unbounded.txt).
 
 ## License
 

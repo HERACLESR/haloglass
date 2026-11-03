@@ -28,7 +28,7 @@
 
 ```bash
 python3 dash.py
-# halogen-dash listening on http://127.0.0.1:8873
+# HaloGlass listening on http://127.0.0.1:8873
 # 然后打开 http://127.0.0.1:8873
 ```
 
@@ -82,7 +82,7 @@ DASH_ALLOWED_HOSTS=my-host
 
 ## 致谢
 
-- 内嵌字体：[Space Grotesk](https://github.com/floriankarsten/space-grotesk) © Florian Karsten，按 **SIL Open Font License 1.1** 授权（字体以 base64 `@font-face` 内嵌于 `dash.py`），许可全文见 [`docs/OFL-SpaceGrotesk.txt`](docs/OFL-SpaceGrotesk.txt)。
+- 内嵌字体：[Space Grotesk](https://github.com/floriankarsten/space-grotesk) © Florian Karsten、[Unbounded](https://github.com/googlefonts/unbounded) © The Unbounded Project Authors（字标），均按 **SIL Open Font License 1.1** 授权（字体以 base64 `@font-face` 内嵌于 `dash.py`），许可全文见 [`docs/OFL-SpaceGrotesk.txt`](docs/OFL-SpaceGrotesk.txt)、[`docs/OFL-Unbounded.txt`](docs/OFL-Unbounded.txt)。
 
 ## 许可
 
