@@ -1144,12 +1144,12 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       </div>
       <div class="card" id="c-pano">
         <h2><span data-i18n="memPano">内存全景</span>
-          <button class="qh" type="button" tabindex="0" aria-label="内存全景说明" data-i18n-aria="memPanoAria" data-tip="六段按占用者划分，合计≈总内存（±采样噪声）&#10;GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，与进程驻留内存独立&#10;文件页缓存：内核文件缓存，自动回收，无需干预&#10;可用内存为引擎运行安全余量（MemAvailable 低于 16 GiB 时 halogen 拒绝启动），并非闲置浪费" data-i18n-tip="memPanoTip">?</button>
+          <button class="qh" type="button" tabindex="0" aria-label="内存全景说明" data-i18n-aria="memPanoAria" data-tip="六段按占用者划分，合计≈主机内存总量 MemTotal（±采样噪声）&#10;GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，与进程驻留内存独立&#10;文件页缓存：内核文件缓存，自动回收，无需干预&#10;可用内存为引擎运行安全余量（MemAvailable 低于 16 GiB 时 halogen 拒绝启动），并非闲置浪费" data-i18n-tip="memPanoTip">?</button>
           <span class="badge miss" id="pano-miss" style="visibility:hidden" data-i18n="missMem">内存数据缺失</span></h2>
         <div class="donut" id="pano">
           <div class="prwrap">
             <svg viewBox="0 0 200 200" aria-hidden="true"><g id="pn-ticks"></g></svg>
-            <div class="donut-center"><div class="dn-num"><span id="donut-total" class="skel sm"></span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= 主机内存（MemTotal）</div></div>
+            <div class="donut-center"><div class="dn-num"><span id="donut-total" class="skel sm"></span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= 主机内存</div></div>
           </div>
         </div>
         <div class="legend" id="pano-legend"><!-- w25-B：六段图例，渲染时按数值降序重排；tooltip 由 updPano 动态挂 data-tip -->
@@ -1776,11 +1776,11 @@ var I18N={
   promptCacheTip:'Prompt 缓存与内存全景中的「文件页缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的文件页缓存（主要为模型查找表）',
  hitRate:'命中率',tokenHitRate:'Token 命中率',cacheSize:'缓存大小',cacheEntries:'缓存条目数',
  memPano:'内存全景',memPanoAria:'内存全景说明',
-  memPanoTip:`六段按占用者划分，合计≈总内存（±采样噪声）
+  memPanoTip:`六段按占用者划分，合计≈主机内存总量 MemTotal（±采样噪声）
 GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，与进程驻留内存独立
 文件页缓存：内核文件缓存，自动回收，无需干预
 可用内存为引擎运行安全余量（MemAvailable 低于 16 GiB 时 halogen 拒绝启动），并非闲置浪费`,
-  missMem:'内存数据缺失',dnSub:'= 主机内存（MemTotal）',
+  missMem:'内存数据缺失',dnSub:'= 主机内存',
   panoEng:'推理引擎驻留内存',panoProc:'其他进程',panoKern:'Linux 内核开销',
   panoRead:'文件页缓存',panoFree:'空闲',panoGtt:'GPU 地址空间（GTT）',
  guideSleep:'模型待命中，开始推理后自动恢复显示数据',
@@ -1854,11 +1854,11 @@ GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，
    promptCacheTip:'Prompt Cache Differs from "File Page Cache" in Memory Panorama: the Former Is halogen’s Session Prefix Cache (in Process Memory); the Latter Is the Linux Kernel’s File Page Cache (Mostly Model Lookup Tables)',
  hitRate:'Hit Rate',tokenHitRate:'Token Hit Rate',cacheSize:'Cache Size',cacheEntries:'Cache Entry Count',
  memPano:'Memory Panorama',memPanoAria:'Memory Panorama Explanation',
-   memPanoTip:`Six segments divided by occupant; sum ≈ total memory (± sampling noise)
+   memPanoTip:`Six segments divided by occupant; sum ≈ total host memory MemTotal (± sampling noise)
  GPU Address Space (GTT): engine-dedicated region of host memory allocated by the GPU driver, accounted independently of process resident memory
  File Page Cache: kernel file cache, reclaimed automatically, no intervention required
  Available memory is the engine’s safety margin (halogen refuses to start when MemAvailable falls below 16 GiB), not idle waste`,
-  missMem:'Memory Data Unavailable',dnSub:'= Host Memory (MemTotal)',
+  missMem:'Memory Data Unavailable',dnSub:'= Host Memory',
   panoEng:'Inference Engine Resident Memory',panoProc:'Other Processes',panoKern:'Linux Kernel Overhead',
   panoRead:'File Page Cache',panoFree:'Free',panoGtt:'GPU Address Space (GTT)',
  guideSleep:'Model Sleeping; Data Resumes When Inference Starts',
@@ -1932,11 +1932,11 @@ GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，
   promptCacheTip:'Prompt 캐시는 메모리 파노라마의 "파일 페이지 캐시"와 다릅니다: 전자는 halogen의 세션 접두어 캐시(프로세스 메모리 내)이며, 후자는 Linux 커널의 파일 페이지 캐시(주로 모델 탐색 테이블)입니다',
  hitRate:'적중률',tokenHitRate:'Token 적중률',cacheSize:'캐시 크기',cacheEntries:'캐시 항목 수',
  memPano:'메모리 파노라마',memPanoAria:'메모리 파노라마 설명',
-  memPanoTip:`6개 구간은 점유자 기준으로 구분하며, 합계 ≈ 총 메모리(± 샘플링 오차)
+  memPanoTip:`6개 구간은 점유자 기준으로 구분하며, 합계 ≈ 총 호스트 메모리 MemTotal(± 샘플링 오차)
  GPU 주소 공간(GTT): GPU 드라이버가 엔진 전용으로 할당한 호스트 메모리로, 프로세스 상주 메모리와 독립적으로 집계됨
  파일 페이지 캐시: 커널 파일 캐시로 자동 회수되며 조치가 불필요함
  가용 메모리는 엔진 실행 안전 여유분입니다(MemAvailable이 16 GiB 미만이면 halogen은 시작을 거부함), 유휴 낭비가 아님`,
-  missMem:'메모리 데이터 없음',dnSub:'= 호스트 메모리(MemTotal)',
+  missMem:'메모리 데이터 없음',dnSub:'= 호스트 메모리',
   panoEng:'추론 엔진 상주 메모리',panoProc:'기타 프로세스',panoKern:'Linux 커널 오버헤드',
   panoRead:'파일 페이지 캐시',panoFree:'빈 영역',panoGtt:'GPU 주소 공간(GTT)',
  guideSleep:'모델 절전 중; 추론이 시작되면 데이터가 자동으로 복구됩니다',
@@ -2010,11 +2010,11 @@ Snapshot-Umzüge/Fragmentierungs-Bereinigungen/Reservierungs-Komprimierungen sin
   promptCacheTip:'Der Prompt-Cache unterscheidet sich vom "Datei-Page-Cache" im Speicher-Panorama: Ersterer ist halogens Sitzungs-Präfix-Cache (im Prozessspeicher), Letzterer der Datei-Page-Cache des Linux-Kernels (hauptsächlich Modell-Lookup-Tabellen)',
  hitRate:'Trefferquote',tokenHitRate:'Token-Trefferquote',cacheSize:'Cache-Größe',cacheEntries:'Cache-Einträge',
  memPano:'Speicher-Panorama',memPanoAria:'Erklärung zum Speicher-Panorama',
-  memPanoTip:`Sechs Segmente nach Besitzer; Summe ≈ Gesamtspeicher (± Abtast-Rauschen)
+  memPanoTip:`Sechs Segmente nach Besitzer; Summe ≈ Host-Gesamtspeicher MemTotal (± Abtast-Rauschen)
  GPU-Adressraum (GTT): von der GPU-Treiber-Zuweisung reservierter Engine-Bereich des Hauptspeichers, unabhängig vom Resident-Speicher der Prozesse gezählt
  Datei-Page-Cache: Kernel-Datei-Cache, automatisch zurückgefordert, kein Eingriff erforderlich
  Verfügbarer Speicher ist die Sicherheitsmarge der Engine (halogen verweigert den Start, wenn MemAvailable unter 16 GiB fällt), keine brachliegende Verschwendung`,
-  missMem:'Speicherdaten nicht verfügbar',dnSub:'= Host-Speicher (MemTotal)',
+  missMem:'Speicherdaten nicht verfügbar',dnSub:'= Host-Speicher',
   panoEng:'Inferenz-Engine-Resident-Speicher',panoProc:'Andere Prozesse',panoKern:'Linux-Kernel-Overhead',
   panoRead:'Datei-Page-Cache',panoFree:'Frei',panoGtt:'GPU-Adressraum (GTT)',
  guideSleep:'Modell im Schlafmodus; Daten werden bei Inferenzbeginn automatisch wieder angezeigt',
