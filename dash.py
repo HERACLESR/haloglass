@@ -102,10 +102,13 @@ def fetch_retry(fn, retry_timeout=0.5):
 
 
 def proc_rss_kib():
-    """返回 (全部进程 RSS 合计 KiB, flash_serve 进程 RSS 合计 KiB)；
-    找不到 flash_serve 进程返回 (None, None)（前端显骨架）。"""
+    """返回 (全部进程 RSS 合计 KiB, flash_serve 进程 RSS 合计 KiB,
+    引擎 RssFile 合计 KiB, 引擎 RssShmem 合计 KiB)（w25-A：后两项供内存全景去重）；
+    找不到 flash_serve 进程返回 (None, None, 0, 0)（前端显骨架）。"""
     tot = 0
     eng = 0
+    eng_file = 0
+    eng_shmem = 0
     found = False
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -113,19 +116,24 @@ def proc_rss_kib():
         try:
             with open("/proc/%s/cmdline" % d, "rb") as f:
                 cmd = f.read(2048)
-            rss = 0
+            rss = rfile = rshmem = 0
             with open("/proc/%s/status" % d) as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
                         rss = int(line.split()[1])
-                        break
+                    elif line.startswith("RssFile:"):  # w25-A：mmap 文件页（引擎权重）
+                        rfile = int(line.split()[1])
+                    elif line.startswith("RssShmem:"):  # w25-A：shmem 驻留（tmpfs 等）
+                        rshmem = int(line.split()[1])
         except (OSError, ValueError):
             continue
         tot += rss
         if ENGINE_PROC.encode() in cmd:  # w15-合规P1-7：进程名可配（默认 flash_serve）
             eng += rss
+            eng_file += rfile   # w25-A
+            eng_shmem += rshmem  # w25-A
             found = True
-    return (tot, eng) if found else (None, None)
+    return (tot, eng, eng_file, eng_shmem) if found else (None, None, 0, 0)
 
 
 # w22-B: 引擎 checkpoint 真名（量化徽章）。best-effort 只读采集：扫 /proc/[0-9]*/cmdline 找 --ck/--checkpoint，
@@ -431,20 +439,22 @@ def collect_once():
             snap["mem_free_gib"] = round(free / gib, 1)
             snap["mem_available_gib"] = round(mem.get("MemAvailable", 0) / gib, 1)
             # 内存全景 6 段（按占用者口径，和 = MemTotal；flash_serve 读不到则整卡不出键=前端骨架）
-            tot_kib, eng_kib = proc_rss_kib()
+            # w25-A：文件页缓存段减去引擎 RssFile/RssShmem（引擎 mmap 权重同时计入 Cached，
+            #        V2 模型下引擎 RssFile 达 86.5 GiB，不去重会重复计算）；
+            #        内核段改为 SUnreclaim+KernelStack+PageTables（SReclaimable 移入文件页缓存段）；
+            #        删除原「其他驻留=残差」段，新增 GPU 地址空间（GTT）段（见下方 gtt 采集后赋值）
+            tot_kib, eng_kib, eng_file_kib, eng_shmem_kib = proc_rss_kib()
             if tot_kib is not None:
-                kernel = (mem.get("Slab", 0) + mem.get("KernelStack", 0)
+                kernel = (mem.get("SUnreclaim", 0) + mem.get("KernelStack", 0)
                           + mem.get("PageTables", 0))
                 readc = (mem.get("Cached", 0) + mem.get("Buffers", 0)
-                         + mem.get("SReclaimable", 0))
+                         + mem.get("SReclaimable", 0) - eng_file_kib - eng_shmem_kib)
                 others = tot_kib - eng_kib
-                pinned = total - eng_kib - others - kernel - readc - free
                 snap["pano_engine_gib"] = round(eng_kib / gib, 1)
                 snap["pano_procs_gib"] = round(others / gib, 1)
                 snap["pano_kernel_gib"] = round(kernel / gib, 1)
-                snap["pano_readcache_gib"] = round(readc / gib, 1)
+                snap["pano_readcache_gib"] = round(max(readc, 0) / gib, 1)
                 snap["pano_free_gib"] = round(free / gib, 1)
-                snap["pano_pinned_gib"] = round(max(pinned, 0) / gib, 1)
     except Exception as e:
         snap["err_meminfo"] = type(e).__name__
     v = to_int(read_text(DRM / "gpu_busy_percent"))
@@ -457,6 +467,10 @@ def collect_once():
         v = to_int(read_text(DRM / fname))
         if v is not None:
             snap[key] = round(v / (1024 ** 3), 2)
+    # w25-A：GPU 地址空间（GTT）全景段——复用上列 /sys gtt_used 值（已为 GiB）；
+    # 仅当全景卡有数据（引擎可读）时出键，保持「整卡不出键=前端骨架」行为不变
+    if "pano_engine_gib" in snap and snap.get("gtt_used_gib") is not None:
+        snap["pano_gtt_gib"] = snap["gtt_used_gib"]
     # 本机为 APU：模型权重走 GTT，"显存"口径 = VRAM+GTT（vram_* 字段保留原义不动）
     vu, gu = snap.get("vram_used_gib"), snap.get("gtt_used_gib")
     if vu is not None or gu is not None:
@@ -685,7 +699,7 @@ HTML = """<!DOCTYPE html>
   --seg-idle-text:#475569;--seg-idle-bar:#64748b;
   --seg-norm-text:#295ff8;--seg-norm-bar:#4a77f9;
   --seg-high-text:#b45309;--seg-high-bar:#d97706;
-  --pano-eng:#4066c4;--pano-proc:#8578bd;--pano-kern:#5d6d88;--pano-read:#5f9fc4;--pano-pin:#57a98c;--pano-free:#b9c4d8;
+  --pano-eng:#4066c4;--pano-proc:#8578bd;--pano-kern:#5d6d88;--pano-read:#5f9fc4;--pano-gtt:#57a98c;--pano-free:#b9c4d8;
   --danger-glow:rgba(185,28,28,.4);
   --tip-bg:rgba(15,23,42,.96);--tip-fg:#f8fafc;
   --mono:ui-monospace,"Cascadia Mono",Consolas,"JetBrains Mono",monospace;
@@ -709,7 +723,7 @@ HTML = """<!DOCTYPE html>
   --seg-idle-text:#94a3b8;--seg-idle-bar:#64748b;
   --seg-norm-text:#5d9bf5;--seg-norm-bar:#5d9bf5;
   --seg-high-text:#e5b455;--seg-high-bar:#f59e0b;
-  --pano-eng:#6d9be8;--pano-proc:#a58fd6;--pano-kern:#8494ab;--pano-read:#6fb0d6;--pano-pin:#67b394;--pano-free:#c0ccdf;
+  --pano-eng:#6d9be8;--pano-proc:#a58fd6;--pano-kern:#8494ab;--pano-read:#6fb0d6;--pano-gtt:#67b394;--pano-free:#c0ccdf;
   --danger-glow:rgba(255,139,134,.45);
   --tip-bg:rgba(2,6,23,.97);--tip-fg:#e9edf5;
 }
@@ -914,7 +928,7 @@ h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em;min-width:0;whi
 #pn-ticks .pk-kern{stroke:var(--pano-kern)}
 #pn-ticks .pk-read{stroke:var(--pano-read)}
 #pn-ticks .pk-free{stroke:var(--pano-free)}
-#pn-ticks .pk-pin{stroke:var(--pano-pin)}
+#pn-ticks .pk-gtt{stroke:var(--pano-gtt)}
 .donut-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;text-align:center}
 .dn-num{font-family:var(--display);font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em;line-height:1.2;white-space:nowrap}
 .dn-sub{position:absolute;left:0;right:0;top:calc(50% + 11px);font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
@@ -1111,7 +1125,7 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
     <section class="bento bot">
       <div class="card" id="c-pc">
         <h2><span data-i18n="promptCache">Prompt 缓存</span>
-          <button class="qh" type="button" tabindex="0" aria-label="Prompt 缓存说明" data-i18n-aria="promptCacheAria" data-tip="Prompt 缓存与内存全景中的「磁盘读缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的磁盘读缓存（主要为模型查找表）" data-i18n-tip="promptCacheTip">?</button>
+          <button class="qh" type="button" tabindex="0" aria-label="Prompt 缓存说明" data-i18n-aria="promptCacheAria" data-tip="Prompt 缓存与内存全景中的「文件页缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的文件页缓存（主要为模型查找表）" data-i18n-tip="promptCacheTip">?</button>
           <span class="badge miss" id="pc-miss" style="visibility:hidden" data-i18n="missCache">cache 数据缺失</span></h2>
         <div class="stat-row">
           <div class="stat g"><div class="v" id="pc-hit"><span class="skel sm"></span></div><div class="lbl" data-i18n="hitRate">命中率</div></div>
@@ -1130,21 +1144,21 @@ svg.spark{width:100%;height:100%;min-height:0;display:block}
       </div>
       <div class="card" id="c-pano">
         <h2><span data-i18n="memPano">内存全景</span>
-          <button class="qh" type="button" tabindex="0" aria-label="内存全景说明" data-i18n-aria="memPanoAria" data-tip="六段按占用者划分，合计 = 总内存&#10;磁盘读缓存：内核文件读缓存，可随时回收，不构成负载&#10;主机内存「可用」长期保持 16–20 GiB，为引擎运行安全余量（MemAvailable 低于 16 GiB 时引擎拒绝启动），并非闲置浪费" data-i18n-tip="memPanoTip">?</button>
+          <button class="qh" type="button" tabindex="0" aria-label="内存全景说明" data-i18n-aria="memPanoAria" data-tip="六段按占用者划分，合计≈总内存（±采样噪声）&#10;GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，与进程驻留内存独立&#10;文件页缓存：内核文件缓存，自动回收，无需干预&#10;可用内存为引擎运行安全余量（MemAvailable 低于 16 GiB 时 halogen 拒绝启动），并非闲置浪费" data-i18n-tip="memPanoTip">?</button>
           <span class="badge miss" id="pano-miss" style="visibility:hidden" data-i18n="missMem">内存数据缺失</span></h2>
         <div class="donut" id="pano">
           <div class="prwrap">
             <svg viewBox="0 0 200 200" aria-hidden="true"><g id="pn-ticks"></g></svg>
-            <div class="donut-center"><div class="dn-num"><span id="donut-total" class="skel sm"></span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= GTT 内存</div></div>
+            <div class="donut-center"><div class="dn-num"><span id="donut-total" class="skel sm"></span> <span style="font-size:11px;font-weight:600">GiB</span></div><div class="dn-sub" data-i18n="dnSub">= 主机内存（MemTotal）</div></div>
           </div>
         </div>
-        <div class="legend" id="pano-legend">
-          <span class="lg-item" id="lg-eng-s"><i style="background:var(--pano-eng)"></i><span data-i18n="panoEng">推理引擎（模型+KV 缓存池）</span> <b id="lg-eng" class="skel sm"></b></span>
+        <div class="legend" id="pano-legend"><!-- w25-B：六段图例，渲染时按数值降序重排；tooltip 由 updPano 动态挂 data-tip -->
+          <span class="lg-item" id="lg-eng-s"><i style="background:var(--pano-eng)"></i><span data-i18n="panoEng">推理引擎驻留内存</span> <b id="lg-eng" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-gtt-s"><i style="background:var(--pano-gtt)"></i><span data-i18n="panoGtt">GPU 地址空间（GTT）</span> <b id="lg-gtt" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-read-s"><i style="background:var(--pano-read)"></i><span data-i18n="panoRead">文件页缓存</span> <b id="lg-read" class="skel sm"></b></span>
           <span class="lg-item" id="lg-proc-s"><i style="background:var(--pano-proc)"></i><span data-i18n="panoProc">其他进程</span> <b id="lg-proc" class="skel sm"></b></span>
-          <span class="lg-item" id="lg-kern-s"><i style="background:var(--pano-kern)"></i><span data-i18n="panoKern">内核占用</span> <b id="lg-kern" class="skel sm"></b></span>
-          <span class="lg-item" id="lg-read-s"><i style="background:var(--pano-read)"></i><span data-i18n="panoRead">磁盘读缓存（可回收）</span> <b id="lg-read" class="skel sm"></b></span>
+          <span class="lg-item" id="lg-kern-s"><i style="background:var(--pano-kern)"></i><span data-i18n="panoKern">Linux 内核开销</span> <b id="lg-kern" class="skel sm"></b></span>
           <span class="lg-item" id="lg-free-s"><i style="background:var(--pano-free)"></i><span data-i18n="panoFree">空闲</span> <b id="lg-free" class="skel sm"></b></span>
-          <span class="lg-item" id="lg-pin-s"><i style="background:var(--pano-pin)"></i><span data-i18n="panoPin">其他驻留</span> <b id="lg-pin" class="skel sm"></b></span>
         </div>
       </div>
     </section>
@@ -1447,8 +1461,9 @@ function updSlots(s){
     else{sr.children[2].className='idle-t';
       sr.children[2].textContent=engDown?(s.engine_sleeping?t('shortSleep'):t('slotOffline')):(busy?t('slotGenerating'):t('slotIdle'));}}}
 /* ---------- 内存全景（w9-E：放射刻度环，60 根 ×6°=360°，刻度几何/粗细同占用率仪表 .tk；w9-I：断供保持） ---------- */
-var PANO=[['eng','pano_engine_gib'],['proc','pano_procs_gib'],['kern','pano_kernel_gib'],
-          ['read','pano_readcache_gib'],['free','pano_free_gib'],['pin','pano_pinned_gib']];
+/* w25-C：六段=引擎/GTT/文件页缓存/其他进程/内核/空闲；渲染时按数值降序排序（缺数据段排最后并隐藏行） */
+var PANO=[['eng','pano_engine_gib'],['gtt','pano_gtt_gib'],['read','pano_readcache_gib'],
+          ['proc','pano_procs_gib'],['kern','pano_kernel_gib'],['free','pano_free_gib']];
 var PT=[];
 (function(){var g=$('pn-ticks');
   for(var i=0;i<60;i++){var ln=document.createElementNS('http://www.w3.org/2000/svg','line');
@@ -1460,39 +1475,48 @@ function updPano(s){
   var ok=!!(mt&&isNum(s.pano_engine_gib));
   vis($('pano-miss'),isNum(s.ts)&&!ok);
   hv('donut-total',ok,num(mt,1),$('donut-total'),'sm');
-  var gtt=isNum(s.gtt_used_gib)?num(s.gtt_used_gib,1):'—';
   var mav=isNum(s.mem_available_gib)?num(s.mem_available_gib,1):'—';
-  var tips={eng:t('tipEng',{gtt:gtt}),
+  var tips={eng:t('tipEng'),
+    gtt:t('tipGtt'),
+    read:t('tipRead'),
     proc:t('tipProc'),
     kern:t('tipKern'),
-    read:t('tipRead'),
-    free:t('tipFree',{mav:mav}),
-    pin:t('tipPin')};
+    free:t('tipFree',{mav:mav})};
+  /* w25-C：六段按数值降序排序（缺数据段视为 -1 排最后）；环与图例共用同一顺序 */
+  var ord=PANO.slice().sort(function(a,b){
+    var x=isNum(s[a[1]])?s[a[1]]:-1,y=isNum(s[b[1]])?s[b[1]]:-1;return y-x;});
   var fr=[];
   if(ok){
     var sum=0;
-    for(var i=0;i<PANO.length;i++){var f=isNum(s[PANO[i][1]])?Math.max(0,Math.min(s[PANO[i][1]]/mt,1)):0;fr.push(f);sum+=f;}
+    for(var i=0;i<ord.length;i++){var f=isNum(s[ord[i][1]])?Math.max(0,Math.min(s[ord[i][1]]/mt,1)):0;fr.push(f);sum+=f;}
     if(sum>0)for(var n=0;n<fr.length;n++)fr[n]/=sum;
-    lastGood['pano-fr']=fr;
-  }else if('pano-fr' in lastGood){fr=lastGood['pano-fr'];}
+    lastGood['pano-fr']={fr:fr,ord:ord};  /* w25-C：断供保持时序与占比同序保持 */
+  }else if('pano-fr' in lastGood){fr=lastGood['pano-fr'].fr;ord=lastGood['pano-fr'].ord;}
   var starts=[],acc=0;
-  for(var m=0;m<PANO.length;m++){starts.push(acc);acc+=fr[m];}
+  for(var m=0;m<ord.length;m++){starts.push(acc);acc+=fr[m];}
   for(var q=0;q<60;q++){
     var a=(q+0.5)/60,cls='tk',key=null;
-    for(var j=0;j<PANO.length;j++){if(a>=starts[j]&&a<starts[j]+fr[j]){cls='tk pk-'+PANO[j][0];key=PANO[j][0];break;}}
+    for(var j=0;j<ord.length;j++){if(a>=starts[j]&&a<starts[j]+fr[j]){cls='tk pk-'+ord[j][0];key=ord[j][0];break;}}
     var ln=PT[q];
     if(ln.getAttribute('class')!==cls)ln.setAttribute('class',cls);
     if(key)ln.setAttribute('data-tip',tips[key]);
     else if(ln.hasAttribute('data-tip'))ln.removeAttribute('data-tip');}
-  for(var p=0;p<PANO.length;p++){
-    var k=PANO[p][0],v=s[PANO[p][1]],lg=$('lg-'+k),lgs=$('lg-'+k+'-s');
+  var lgWrap=$('pano-legend');
+  for(var p=0;p<ord.length;p++){
+    var k=ord[p][0],v=s[ord[p][1]],lg=$('lg-'+k),lgs=$('lg-'+k+'-s');
     hv('lg-'+k,isNum(v),num(v,1),lg,'sm');
-    lgs.setAttribute('data-tip',tips[k]);}}
+    lgs.setAttribute('data-tip',tips[k]);
+    show(lgs,!ok||isNum(v));            /* w25-C：有数据时缺该段则隐藏该行；整卡无数据保持骨架 */
+    if(lgWrap.children[p]!==lgs)lgWrap.appendChild(lgs);}}  /* w25-C：图例行按降序重排 */
 /* ---------- 主渲染 ---------- */
 function render(s){
   lastData=s;
   if(DEMO==='empty')s={ts:Date.now()/1000,halogen_ok:false,err_health:'demo',err_metrics:'demo',err_cache:'demo'};
   if(DEMO==='sleep')s={ts:Date.now()/1000,halogen_ok:true,engine_sleeping:true};
+  /* w25-G：demo 模式内存全景演示值（六段齐全，合计=MemTotal；MemAvailable≈空闲+可回收缓存） */
+  if(DEMO&&DEMO!=='empty'&&DEMO!=='sleep'&&!isNum(s.mem_total_gib))
+    s=Object.assign({},s,{mem_total_gib:125.6,mem_available_gib:24.7,pano_engine_gib:62.0,pano_gtt_gib:28.5,
+      pano_readcache_gib:18.3,pano_procs_gib:6.2,pano_kernel_gib:1.4,pano_free_gib:9.2});
   var H=DEMO?[]:hist;
   var first=!isNum(s.ts);
   var sleeping=!!s.engine_sleeping;
@@ -1749,15 +1773,16 @@ var I18N={
  missCache:'cache 数据缺失',cumWait:'累计等待',coldRecompute:'冷重算次数',heldSessions:'占位会话数',
  snapReloc:'快照搬移次数',defrag:'碎片整理次数',reservedCompress:'压缩预留次数',
  promptCache:'Prompt 缓存',promptCacheAria:'Prompt 缓存说明',
- promptCacheTip:'Prompt 缓存与内存全景中的「磁盘读缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的磁盘读缓存（主要为模型查找表）',
+  promptCacheTip:'Prompt 缓存与内存全景中的「文件页缓存」不同：前者是 halogen 的会话前缀缓存（位于进程内存中），后者是 Linux 内核的文件页缓存（主要为模型查找表）',
  hitRate:'命中率',tokenHitRate:'Token 命中率',cacheSize:'缓存大小',cacheEntries:'缓存条目数',
  memPano:'内存全景',memPanoAria:'内存全景说明',
- memPanoTip:`六段按占用者划分，合计 = 总内存
-磁盘读缓存：内核文件读缓存，可随时回收，不构成负载
-主机内存「可用」长期保持 16–20 GiB，为引擎运行安全余量（MemAvailable 低于 16 GiB 时引擎拒绝启动），并非闲置浪费`,
- missMem:'内存数据缺失',dnSub:'= GTT 内存',
- panoEng:'推理引擎（模型+KV 缓存池）',panoProc:'其他进程',panoKern:'内核占用',
- panoRead:'磁盘读缓存（可回收）',panoFree:'空闲',panoPin:'其他驻留',
+  memPanoTip:`六段按占用者划分，合计≈总内存（±采样噪声）
+GPU 地址空间（GTT）：GPU 驱动为主机内存分配的引擎专用区，与进程驻留内存独立
+文件页缓存：内核文件缓存，自动回收，无需干预
+可用内存为引擎运行安全余量（MemAvailable 低于 16 GiB 时 halogen 拒绝启动），并非闲置浪费`,
+  missMem:'内存数据缺失',dnSub:'= 主机内存（MemTotal）',
+  panoEng:'推理引擎驻留内存',panoProc:'其他进程',panoKern:'Linux 内核开销',
+  panoRead:'文件页缓存',panoFree:'空闲',panoGtt:'GPU 地址空间（GTT）',
  guideSleep:'模型待命中，开始推理后自动恢复显示数据',
  guideOff:'引擎未响应 — 请检查 halogen 容器是否在运行，恢复后将自动显示数据',
  shortSleep:'待命中',shortOff:'等待引擎恢复',collecting:'采集中…',
@@ -1772,10 +1797,11 @@ var I18N={
  footerMain:'采集间隔约 {iv} 秒 · 历史窗口约 {wm} 分钟 · 只读监控，不影响 halogen 运行',
  footerErr:' · 采集异常：{errs} 本轮数据缺失',listSep:'、',
  connRetry:'无法连接仪表盘服务器，正在重试…',secUnit:' 秒',
- tipEng:'模型权重约 60 GiB + KV 缓存池（GPU 映射）{gtt} GiB + 运行时堆',
- tipProc:'除推理引擎外全部进程的 RSS 合计',tipKern:'内核 Slab + 内核栈 KernelStack + 页表 PageTables',
- tipRead:'内核文件读缓存，可随时回收，不构成负载',tipFree:'MemAvailable 约 {mav} GiB（含可回收缓存）',
- tipPin:'未能归入前五段的内存（tmpfs/共享内存/驱动驻留等）'
+  tipEng:'推理引擎进程的常驻内存，包含模型权重、KV 缓存池、工作缓冲区与查找表热页；引擎当前未公开分项指标，此处为常驻集合总量（VmRSS）。',
+  tipGtt:'GPU 驱动为引擎分配的主机内存，KV 缓存池与工作缓冲区经 GTT 分配；与引擎进程驻留内存独立计数，无重复计算。',
+  tipRead:'内核对近期读写文件数据的缓存，内存紧张时自动回收，无需干预。引擎的 n-gram 查找表按需从磁盘读取，其热点页计入本区域。',
+  tipProc:'除推理引擎外全部进程的常驻内存合计。',tipKern:'内核自身占用的内存：不可回收 Slab、页表与内核栈。',
+  tipFree:'当前未被任何程序使用的物理内存，按需即时分配。可用内存（MemAvailable）约 {mav} GiB，实时波动——不触发磁盘交换即可投入使用的内存；halogen 启动要求该值 ≥16 GiB（引擎文档行为），此数值为系统安全余量，而非可自由支配容量。'
 },
 'en':{
  title:'HaloGlass',modelInfo:'Model Info',ctxLen:'Context Length',
@@ -1825,15 +1851,16 @@ var I18N={
  missCache:'Cache Data Unavailable',cumWait:'Cumulative Wait',coldRecompute:'Cold Recompute Count',heldSessions:'Held Session Count',
  snapReloc:'Snapshot Relocation Count',defrag:'Defragment Count',reservedCompress:'Reserved Compression Count',
  promptCache:'Prompt Cache',promptCacheAria:'Prompt Cache Explanation',
-  promptCacheTip:'Prompt Cache Differs from "Disk Read Cache" in Memory Panorama: the Former Is halogen’s Session Prefix Cache (in Process Memory); the Latter Is the Linux Kernel’s Disk Read Cache (Mostly Model Lookup Tables)',
+   promptCacheTip:'Prompt Cache Differs from "File Page Cache" in Memory Panorama: the Former Is halogen’s Session Prefix Cache (in Process Memory); the Latter Is the Linux Kernel’s File Page Cache (Mostly Model Lookup Tables)',
  hitRate:'Hit Rate',tokenHitRate:'Token Hit Rate',cacheSize:'Cache Size',cacheEntries:'Cache Entry Count',
  memPano:'Memory Panorama',memPanoAria:'Memory Panorama Explanation',
-  memPanoTip:`Six Segments Split by Owner; Sum = Total Memory
- Disk Read Cache: Kernel File Read Cache, Reclaimable Anytime, Does Not Constitute Load
- Host "Available" Memory Stays at 16–20 GiB as the Engine Safety Margin (below 16 GiB MemAvailable the Engine Refuses to Start); Not Idle Waste`,
- missMem:'Memory Data Unavailable',dnSub:'= GTT Memory',
- panoEng:'Inference Engine (Model + KV Cache Pool)',panoProc:'Other Processes',panoKern:'Kernel Usage',
- panoRead:'Disk Read Cache (Reclaimable)',panoFree:'Free',panoPin:'Other Pinned',
+   memPanoTip:`Six segments divided by occupant; sum ≈ total memory (± sampling noise)
+ GPU Address Space (GTT): engine-dedicated region of host memory allocated by the GPU driver, accounted independently of process resident memory
+ File Page Cache: kernel file cache, reclaimed automatically, no intervention required
+ Available memory is the engine’s safety margin (halogen refuses to start when MemAvailable falls below 16 GiB), not idle waste`,
+  missMem:'Memory Data Unavailable',dnSub:'= Host Memory (MemTotal)',
+  panoEng:'Inference Engine Resident Memory',panoProc:'Other Processes',panoKern:'Linux Kernel Overhead',
+  panoRead:'File Page Cache',panoFree:'Free',panoGtt:'GPU Address Space (GTT)',
  guideSleep:'Model Sleeping; Data Resumes When Inference Starts',
  guideOff:'Engine Not Responding — Check the halogen Container; Data Resumes Automatically',
  shortSleep:'Sleeping',shortOff:'Waiting for Engine Recovery',collecting:'Collecting…',
@@ -1848,10 +1875,11 @@ var I18N={
  footerMain:'Sampling Interval ~{iv} s · History Window ~{wm} min · Read-Only Monitoring; Does Not Affect halogen',
  footerErr:' · Collection Error: {errs} Data Unavailable This Round',listSep:', ',
  connRetry:'Cannot Reach the Dashboard Server, Retrying…',secUnit:' s',
- tipEng:'Model Weights ~60 GiB + KV Cache Pool (GPU Mapped) {gtt} GiB + Runtime Heap',
-  tipProc:'Total RSS of All Processes Except the Inference Engine',tipKern:'Kernel Slab + KernelStack + PageTables',
-  tipRead:'Kernel File Read Cache; Reclaimable Anytime; Does Not Constitute Load',tipFree:'MemAvailable ~{mav} GiB (Including Reclaimable Cache)',
-  tipPin:'Memory Not Fitting the First Five Segments (tmpfs/Shared Memory/Driver Pinned, Etc.)'
+  tipEng:'Resident memory of the inference engine process, covering model weights, the KV cache pool, working buffers, and hot pages of lookup tables; the engine does not currently expose per-component metrics, so this is the total resident set (VmRSS).',
+   tipGtt:'Host memory allocated by the GPU driver for the engine; the KV cache pool and working buffers are allocated through GTT; accounted independently of the engine process’s resident memory, with no double counting.',
+   tipRead:'The kernel’s cache of recently read and written file data, reclaimed automatically under memory pressure, no intervention required. The engine’s n-gram lookup table is read from disk on demand; its hot pages are counted in this region.',
+   tipProc:'Combined resident memory of all processes other than the inference engine.',tipKern:'Memory occupied by the kernel itself: unreclaimable Slab, page tables, and kernel stacks.',
+   tipFree:'Physical memory currently unused by any program, allocated on demand instantly. Available memory (MemAvailable) is approximately {mav} GiB and fluctuates in real time — memory that can be put into use without triggering disk swapping; halogen requires this value to be at least 16 GiB at startup (documented engine behavior); this figure is the system’s safety margin, not freely disposable capacity.'
 },
 'ko':{
  title:'HaloGlass',modelInfo:'모델 정보',ctxLen:'컨텍스트 길이',
@@ -1901,15 +1929,16 @@ var I18N={
  missCache:'cache 데이터 없음',cumWait:'누적 대기',coldRecompute:'콜드 재계산 수',heldSessions:'점유 세션 수',
  snapReloc:'스냅샷 이동 수',defrag:'단편화 정리 수',reservedCompress:'예약 압축 수',
  promptCache:'Prompt 캐시',promptCacheAria:'Prompt 캐시 설명',
- promptCacheTip:'Prompt 캐시는 메모리 파노라마의 "디스크 읽기 캐시"와 다릅니다: 전자는 halogen의 세션 접두어 캐시(프로세스 메모리 내)이며, 후자는 Linux 커널의 디스크 읽기 캐시(주로 모델 탐색 테이블)입니다',
+  promptCacheTip:'Prompt 캐시는 메모리 파노라마의 "파일 페이지 캐시"와 다릅니다: 전자는 halogen의 세션 접두어 캐시(프로세스 메모리 내)이며, 후자는 Linux 커널의 파일 페이지 캐시(주로 모델 탐색 테이블)입니다',
  hitRate:'적중률',tokenHitRate:'Token 적중률',cacheSize:'캐시 크기',cacheEntries:'캐시 항목 수',
  memPano:'메모리 파노라마',memPanoAria:'메모리 파노라마 설명',
- memPanoTip:`6개 구간은 점유자 기준으로 구분하며, 합계 = 총 메모리
-디스크 읽기 캐시: 커널 파일 읽기 캐시로 언제든 회수 가능하며 부하를 구성하지 않음
-호스트 메모리 "가용"은 16–20 GiB를 유지하며 엔진 실행 안전 여유분입니다(MemAvailable이 16 GiB 미만이면 엔진은 시작을 거부함), 유휴 낭비가 아님`,
- missMem:'메모리 데이터 없음',dnSub:'= GTT 메모리',
- panoEng:'추론 엔진(모델+KV 캐시 풀)',panoProc:'기타 프로세스',panoKern:'커널 점유',
- panoRead:'디스크 읽기 캐시(회수 가능)',panoFree:'빈 영역',panoPin:'기타 상주',
+  memPanoTip:`6개 구간은 점유자 기준으로 구분하며, 합계 ≈ 총 메모리(± 샘플링 오차)
+ GPU 주소 공간(GTT): GPU 드라이버가 엔진 전용으로 할당한 호스트 메모리로, 프로세스 상주 메모리와 독립적으로 집계됨
+ 파일 페이지 캐시: 커널 파일 캐시로 자동 회수되며 조치가 불필요함
+ 가용 메모리는 엔진 실행 안전 여유분입니다(MemAvailable이 16 GiB 미만이면 halogen은 시작을 거부함), 유휴 낭비가 아님`,
+  missMem:'메모리 데이터 없음',dnSub:'= 호스트 메모리(MemTotal)',
+  panoEng:'추론 엔진 상주 메모리',panoProc:'기타 프로세스',panoKern:'Linux 커널 오버헤드',
+  panoRead:'파일 페이지 캐시',panoFree:'빈 영역',panoGtt:'GPU 주소 공간(GTT)',
  guideSleep:'모델 절전 중; 추론이 시작되면 데이터가 자동으로 복구됩니다',
  guideOff:'엔진 응답 없음 — halogen 컨테이너 실행 여부를 확인하세요. 복구 후 데이터가 자동으로 표시됩니다',
  shortSleep:'절전',shortOff:'엔진 복구 대기',collecting:'수집 중…',
@@ -1924,10 +1953,11 @@ var I18N={
  footerMain:'수집 주기 약 {iv}초 · 히스토리 창 약 {wm}분 · 읽기 전용 모니터링, halogen 실행에 영향 없음',
  footerErr:' · 수집 오류: {errs} 이번 라운드 데이터 없음',listSep:', ',
  connRetry:'대시보드 서버에 연결할 수 없습니다, 재시도 중…',secUnit:'초',
- tipEng:'모델 가중치 약 60 GiB + KV 캐시 풀(GPU 매핑) {gtt} GiB + 런타임 힙',
- tipProc:'추론 엔진을 제외한 모든 프로세스의 RSS 합계',tipKern:'커널 Slab + KernelStack + PageTables',
- tipRead:'커널 파일 읽기 캐시, 언제든 회수 가능, 부하를 구성하지 않음',tipFree:'MemAvailable 약 {mav} GiB(회수 가능 캐시 포함)',
- tipPin:'앞의 다섯 구간에 포함되지 않은 메모리(tmpfs/공유 메모리/드라이버 상주 등)'
+  tipEng:'추론 엔진 프로세스의 상주 메모리로 모델 가중치, KV 캐시 풀, 작업 버퍼, 탐색 테이블의 핫 페이지를 포함합니다. 엔진은 현재 항목별 지표를 공개하지 않으므로 여기서는 상주 집합 총량(VmRSS)을 표시합니다.',
+  tipGtt:'GPU 드라이버가 엔진에 할당한 호스트 메모리로, KV 캐시 풀과 작업 버퍼가 GTT를 통해 할당됩니다. 엔진 프로세스의 상주 메모리와 독립적으로 집계하며 중복 계산이 없습니다.',
+  tipRead:'커널이 최근 읽기/쓰기한 파일 데이터의 캐시로, 메모리 부족 시 자동으로 회수되며 조치가 불필요합니다. 엔진의 n-gram 탐색 테이블은 필요 시 디스크에서 읽히며 해당 핫 페이지는 이 영역에 집계됩니다.',
+  tipProc:'추론 엔진을 제외한 모든 프로세스의 상주 메모리 합계입니다.',tipKern:'커널 자체가 점유하는 메모리: 회수 불가 Slab, 페이지 테이블, 커널 스택.',
+  tipFree:'현재 어떤 프로그램도 사용하지 않는 물리 메모리로 필요 시 즉시 할당됩니다. 가용 메모리(MemAvailable)는 약 {mav} GiB이며 실시간으로 변동합니다 — 디스크 스왑 없이 바로 투입할 수 있는 메모리입니다. halogen 시작 시 이 값이 16 GiB 이상이어야 하며(엔진 문서화된 동작), 이 수치는 시스템 안전 여유분으로 자유 사용이 가능한 용량이 아닙니다.'
 },
 'de':{
  title:'HaloGlass',modelInfo:'Modellinfo',ctxLen:'Kontextlänge',
@@ -1977,15 +2007,16 @@ Snapshot-Umzüge/Fragmentierungs-Bereinigungen/Reservierungs-Komprimierungen sin
  missCache:'cache-Daten nicht verfügbar',cumWait:'Kumulative Wartezeit',coldRecompute:'Kalt-Neuberechnungen',heldSessions:'Haltende Sitzungen',
  snapReloc:'Snapshot-Umzüge',defrag:'Fragmentierungs-Bereinigungen',reservedCompress:'Reservierungs-Komprimierungen',
  promptCache:'Prompt-Cache',promptCacheAria:'Erklärung zum Prompt-Cache',
- promptCacheTip:'Der Prompt-Cache unterscheidet sich vom "Disk-Lese-Cache" im Speicher-Panorama: Ersterer ist halogens Sitzungs-Präfix-Cache (im Prozessspeicher), Letzterer der Disk-Lese-Cache des Linux-Kernels (hauptsächlich Modell-Lookup-Tabellen)',
+  promptCacheTip:'Der Prompt-Cache unterscheidet sich vom "Datei-Page-Cache" im Speicher-Panorama: Ersterer ist halogens Sitzungs-Präfix-Cache (im Prozessspeicher), Letzterer der Datei-Page-Cache des Linux-Kernels (hauptsächlich Modell-Lookup-Tabellen)',
  hitRate:'Trefferquote',tokenHitRate:'Token-Trefferquote',cacheSize:'Cache-Größe',cacheEntries:'Cache-Einträge',
  memPano:'Speicher-Panorama',memPanoAria:'Erklärung zum Speicher-Panorama',
- memPanoTip:`Sechs Segmente nach Besitzer; Summe = Gesamtspeicher
-Disk-Lese-Cache: Kernel-Datei-Lese-Cache, jederzeit rückforderbar, stellt keine Last dar
-Der "verfügbare" Hauptspeicher bleibt dauerhaft bei 16–20 GiB als Sicherheitsmarge für die Engine (unter 16 GiB MemAvailable verweigert die Engine den Start); keine brachliegende Verschwendung`,
- missMem:'Speicherdaten nicht verfügbar',dnSub:'= GTT-Speicher',
- panoEng:'Inferenz-Engine (Modell + KV-Cache-Pool)',panoProc:'Andere Prozesse',panoKern:'Kernel-Belegung',
- panoRead:'Disk-Lese-Cache (rückforderbar)',panoFree:'Frei',panoPin:'Sonstiges Pinned',
+  memPanoTip:`Sechs Segmente nach Besitzer; Summe ≈ Gesamtspeicher (± Abtast-Rauschen)
+ GPU-Adressraum (GTT): von der GPU-Treiber-Zuweisung reservierter Engine-Bereich des Hauptspeichers, unabhängig vom Resident-Speicher der Prozesse gezählt
+ Datei-Page-Cache: Kernel-Datei-Cache, automatisch zurückgefordert, kein Eingriff erforderlich
+ Verfügbarer Speicher ist die Sicherheitsmarge der Engine (halogen verweigert den Start, wenn MemAvailable unter 16 GiB fällt), keine brachliegende Verschwendung`,
+  missMem:'Speicherdaten nicht verfügbar',dnSub:'= Host-Speicher (MemTotal)',
+  panoEng:'Inferenz-Engine-Resident-Speicher',panoProc:'Andere Prozesse',panoKern:'Linux-Kernel-Overhead',
+  panoRead:'Datei-Page-Cache',panoFree:'Frei',panoGtt:'GPU-Adressraum (GTT)',
  guideSleep:'Modell im Schlafmodus; Daten werden bei Inferenzbeginn automatisch wieder angezeigt',
  guideOff:'Engine antwortet nicht — Prüfen Sie den halogen-Container; Daten werden nach der Wiederherstellung automatisch angezeigt',
  shortSleep:'Schlafmodus',shortOff:'Warten auf Engine-Erholung',collecting:'Erfassung…',
@@ -2000,10 +2031,11 @@ Der "verfügbare" Hauptspeicher bleibt dauerhaft bei 16–20 GiB als Sicherheits
  footerMain:'Erfassungsintervall ~{iv} s · Historienfenster ~{wm} min · Nur-Lese-Überwachung; beeinflusst halogen nicht',
  footerErr:' · Erfassungsfehler: {errs} in dieser Runde nicht verfügbar',listSep:', ',
  connRetry:'Dashboard-Server nicht erreichbar, erneuter Versuch…',secUnit:' s',
- tipEng:'Modellgewichte ~60 GiB + KV-Cache-Pool (GPU-gemappt) {gtt} GiB + Runtime-Heap',
- tipProc:'RSS-Summe aller Prozesse außer der Inferenz-Engine',tipKern:'Kernel-Slab + KernelStack + PageTables',
- tipRead:'Kernel-Datei-Lese-Cache, jederzeit rückforderbar, stellt keine Last dar',tipFree:'MemAvailable ~{mav} GiB (einschließlich rückforderbarer Cache)',
- tipPin:'Speicher außerhalb der ersten fünf Segmente (tmpfs/freigegebener Speicher/Treiber-Pinned usw.)'
+  tipEng:'Resident-Speicher des Inferenz-Engine-Prozesses; umfasst Modellgewichte, KV-Cache-Pool, Arbeitspuffer und heiße Seiten der Lookup-Tabellen. Die Engine legt derzeit keine nach Komponenten aufgeschlüsselten Kennzahlen offen; angegeben ist die Gesamtgröße der Belegung (VmRSS).',
+  tipGtt:'Vom GPU-Treiber für die Engine zugewiesener Hauptspeicher; KV-Cache-Pool und Arbeitspuffer werden über GTT zugewiesen. Wird unabhängig vom Resident-Speicher des Engine-Prozesses gezählt, ohne Doppelzählung.',
+  tipRead:'Cache des Kernels für kürzlich gelesene und geschriebene Datei-Daten; wird bei Speicherdruck automatisch zurückgefordert, kein Eingriff erforderlich. Die n-gram-Lookup-Tabelle der Engine wird bei Bedarf von der Disk gelesen; ihre heißen Seiten zählen in diesen Bereich.',
+  tipProc:'Summe des Resident-Speichers aller Prozesse außer der Inferenz-Engine.',tipKern:'Vom Kernel selbst belegter Speicher: nicht rückforderbarer Slab, Page Tables und Kernel-Stacks.',
+  tipFree:'Physischer Speicher, der derzeit von keinem Programm genutzt und bei Bedarf sofort zugeteilt wird. Verfügbarer Speicher (MemAvailable) ca. {mav} GiB, schwankt in Echtzeit — Speicher, der ohne Disk-Swap sofort eingesetzt werden kann; halogen verlangt beim Start mindestens 16 GiB (dokumentiertes Verhalten der Engine); dieser Wert ist die Sicherheitsmarge des Systems, keine frei verfügbare Kapazität.'
 }
 };
 function t(k,p){var d=I18N[lang];var s=(k in d)?d[k]:((k in I18N['zh-CN'])?I18N['zh-CN'][k]:k);
